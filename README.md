@@ -2,23 +2,34 @@
 
 Windows 桌面录制工具。支持哔哩哔哩、斗鱼、虎牙、抖音、YouTube 和 Twitch。各房间独立启停，默认按平台实际提供的画质保存，不重新编码。
 
-## 下载与快速开始
+## 选择一种运行方式
 
-1. 从 GitHub **Releases** 下载 Windows x64 ZIP，解压整个文件夹，不要只移动 EXE。
-2. 安装 [FFmpeg](https://ffmpeg.org/download.html)，让 `ffmpeg.exe` 和 `ffprobe.exe` 都能从系统 PATH 运行。
-3. 运行版本化的 `LiveRecorderDesktop-*.exe`，选择录像目录，添加房间并开启任务。批量添加时一行一个链接。
+**只想使用软件？选方式一。** 不需要下载源码、运行 `启动桌面版.cmd`，也不需要自己打包。
 
-## 从项目目录运行
+### 方式一：下载发行版（推荐）
 
-在本机双击「启动桌面版.cmd」。启动器优先使用 dist 中的 Windows 程序，未打包时使用源码。配置放在本目录的 .runtime\data，初始录像目录为本目录的 Recordings。直接运行打包 EXE（不经启动器）则使用 Windows 用户数据目录和用户视频目录。两种方式的配置目录不同，建议选一种长期使用。界面中可以指定独立的录像根目录；改根目录不搬动旧录像。
+1. 打开 [Releases](https://github.com/Sakura-wcs/live-recorder-desktop/releases/latest)，在 **Assets（资源）** 中下载 `LiveRecorderDesktop-*-Windows-x64.zip`。不要下载 GitHub 自动生成的 `Source code (zip)`。
+2. 解压发行版，在解压目录内双击 `LiveRecorderDesktop-版本号.exe`。保留旁边的 `_internal` 目录，不要只复制 EXE。
 
-新机器可在本目录执行：
+发行版已包含 Python 和界面所需组件，**启动界面不需要另装 Python、PySide6 或构建工具**。默认配置位于 `%LOCALAPPDATA%\LiveRecorderDesktop`，默认录像位于用户视频文件夹下的 `LiveRecorder`。
 
-    python -m venv .venv
-    .\.venv\Scripts\python.exe -m pip install .
-    .\.venv\Scripts\python.exe -m liverecorder
+### 方式二：下载源码，用 CMD 启动（适合开发或修改代码）
 
-录制需要 Windows PATH 中可用的 ffmpeg.exe 和 ffprobe.exe。首次启动不会自动导入原版房间、Cookie 或其他项目配置。平台配置的凭据使用当前 Windows 用户的凭据管理器。
+1. 在仓库主页选择 **Code → Download ZIP**，解压后进入含 `启动桌面版.cmd` 的目录。
+2. 首次运行需要 Python（建议 3.14）。在该目录打开 PowerShell，执行：
+
+   ```powershell
+   python -m venv .venv
+   .\.venv\Scripts\python.exe -m pip install .
+   ```
+
+3. 双击 `启动桌面版.cmd`。**从源码运行不等于构建 EXE**，不需要安装 PyInstaller，也不需要下载发行版。此方式默认将配置和录像分别存放在项目目录的 `.runtime\data` 和 `Recordings`。
+
+两种方式的默认配置目录不同，房间列表和设置不会自动同步。选择一种长期使用即可。可以在软件里更改录像目录，更改后不会移动旧录像。
+
+### 两种方式共用：录制与压缩需要 FFmpeg
+
+只打开界面不需要 FFmpeg。需要录制或压缩时，请准备 [FFmpeg](https://ffmpeg.org/download.html)，确保 `ffmpeg.exe` 和 `ffprobe.exe` 都能从系统 PATH 运行；已有则不用重复安装。首次启动不会自动导入原版房间、Cookie 或其他项目配置。平台凭据由 Windows 凭据管理器保存。
 
 ## 录制与压缩
 
@@ -32,12 +43,19 @@ Windows 桌面录制工具。支持哔哩哔哩、斗鱼、虎牙、抖音、You
 - 「随预设」会显示当前实际 CQ 或 CRF，手动输入数字则覆盖预设的质量值。将鼠标停在选项上可查看说明。
 - 压缩会校验色彩及轨道，含部分复杂旋转或 HDR 元数据、封面、多画面轨的视频会保守跳过或拒绝，原片不受影响。
 
-## 构建
+<details>
+<summary>开发者：如何自行构建 Windows 发行版</summary>
 
-    .\.venv\Scripts\python.exe -m pip install pyinstaller
-    powershell.exe -NoProfile -ExecutionPolicy Bypass -File packaging/build-windows.ps1
+仅在需要生成自己的 EXE 时使用。先完成上面「方式二」的环境准备，再运行：
 
-打包是免安装目录。移动时要保留整个 dist\LiveRecorderDesktop 文件夹，不能只复制 EXE；FFmpeg 仍由系统 PATH 提供。
+```powershell
+.\.venv\Scripts\python.exe -m pip install pyinstaller
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File packaging/build-windows.ps1
+```
+
+产物位于 `dist\LiveRecorderDesktop`，分发时要保留整个目录。普通用户直接下载发行版即可。
+
+</details>
 
 六个平台的插件匹配成功不等于真实房间可录；应先用已获授权且正在开播的房间试录，再用于无人值守。
 
