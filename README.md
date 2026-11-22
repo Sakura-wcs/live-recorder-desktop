@@ -8,10 +8,10 @@ Windows 桌面录制工具。支持哔哩哔哩、斗鱼、虎牙、抖音、You
 
 ### 方式一：下载发行版（推荐）
 
-1. 打开 [Releases](https://github.com/Sakura-wcs/live-recorder-desktop/releases/latest)，在 **Assets（资源）** 中下载 `LiveRecorderDesktop-*-Windows-x64.zip`。不要下载 GitHub 自动生成的 `Source code (zip)`。
-2. 解压发行版，在解压目录内双击 `LiveRecorderDesktop-版本号.exe`。保留旁边的 `_internal` 目录，不要只复制 EXE。
+1. 打开 [Releases](https://github.com/Sakura-wcs/live-recorder-desktop/releases/latest)，在 **Assets（资源）** 中下载 `LiveRecorderDesktop-*-Windows-x64-Setup.exe`。不要下载 GitHub 自动生成的 `Source code (zip)`。
+2. 双击安装包，按向导安装，无需解压。安装完成后，在开始菜单搜索「原画直播录制」启动；桌面快捷方式可在安装时选择。
 
-发行版已包含 Python 和界面所需组件，**启动界面不需要另装 Python、PySide6 或构建工具**。默认配置位于 `%LOCALAPPDATA%\LiveRecorderDesktop`，默认录像位于用户视频文件夹下的 `LiveRecorder`。
+发行版已包含 Python 和界面所需组件，**启动界面不需要另装 Python、PySide6 或构建工具**。默认配置位于 `%LOCALAPPDATA%\LiveRecorderDesktop`，默认录像位于用户视频文件夹下的 `LiveRecorder`。从 Windows「已安装的应用」卸载只移除软件，不删除用户配置或录像。
 
 ### 方式二：下载源码，用 CMD 启动（适合开发或修改代码）
 

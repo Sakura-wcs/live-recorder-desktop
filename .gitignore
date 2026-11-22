@@ -9,3 +9,4 @@ build/
 dist/
 /Recordings/
 /backups/
+/installer-output/

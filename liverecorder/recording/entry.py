@@ -1,9 +1,13 @@
 import argparse
 import logging
+import os
 import sqlite3
+import subprocess
+from functools import partial
 from hashlib import sha256
 from os.path import normcase
 from pathlib import Path
+from types import SimpleNamespace
 
 from ..catalog import Catalog
 from ..paths import AppPaths
@@ -22,6 +26,13 @@ def main():
     parser.add_argument("--container", choices=["mkv", "mp4"], default="mkv")
     args = parser.parse_args()
     logging.disable(logging.CRITICAL)
+    if os.name == "nt":
+        from streamlink.stream import ffmpegmux
+
+        # Streamlink's muxed stream launches FFmpeg internally. Scope the
+        # no-console flag to that module and do not patch subprocess globally.
+        ffmpegmux.subprocess = SimpleNamespace(DEVNULL=subprocess.DEVNULL, PIPE=subprocess.PIPE,
+                                              Popen=partial(subprocess.Popen, creationflags=subprocess.CREATE_NO_WINDOW))
     paths = AppPaths.from_root(args.data)
     with Catalog(paths.catalog) as catalog:
         room = next(item for item in catalog.rooms() if item.id == args.room_id)

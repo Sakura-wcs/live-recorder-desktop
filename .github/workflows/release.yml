@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'v*'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -29,27 +30,22 @@ jobs:
         shell: pwsh
         run: |
           $version = python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])"
-          if ($LASTEXITCODE -ne 0 -or $version -notmatch '^\d+\.\d+\.\d+$' -or $env:GITHUB_REF_NAME -cne "v$version") {
+          if ($LASTEXITCODE -ne 0 -or $version -notmatch '^\d+\.\d+\.\d+$' -or
+              ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME -cne "v$version")) {
               throw 'Release tag and pyproject version must match.'
           }
           "RELEASE_NAME=LiveRecorderDesktop-$version" >> $env:GITHUB_ENV
+          "RELEASE_VERSION=$version" >> $env:GITHUB_ENV
           python -m pip install . "streamlink==8.6.3" "PySide6==6.11.1" "pywin32==311" "PyInstaller==6.19.0" "pyinstaller-hooks-contrib==2026.4"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python -m pip check
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Build and smoke-test
+      - name: Build desktop and worker
         shell: pwsh
         run: |
           powershell.exe -NoProfile -ExecutionPolicy Bypass -File packaging/build-windows.ps1 -ReleaseName $env:RELEASE_NAME
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $exe = Join-Path "dist/$env:RELEASE_NAME" "$env:RELEASE_NAME.exe"
-          & $exe --check-plugins
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $env:QT_QPA_PLATFORM = 'offscreen'
-          & $exe --smoke-test --data-dir "$env:RUNNER_TEMP/smoke-data" --recordings-dir "$env:RUNNER_TEMP/smoke-videos"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          if (!(Test-Path -LiteralPath "$env:RUNNER_TEMP/smoke-data/library.sqlite3")) { throw 'Smoke test did not initialize a catalog.' }
-      - name: Include notices and archive release
+      - name: Include notices and build installer
         shell: pwsh
         run: |
           $folder = "dist/$env:RELEASE_NAME"
@@ -58,15 +54,107 @@ jobs:
           python packaging/dependency-notices.py $notices
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           Copy-Item -LiteralPath packaging/licenses/qt -Destination $notices -Recurse
-          $zip = "dist/$env:RELEASE_NAME-Windows-x64.zip"
-          [System.IO.Compression.ZipFile]::CreateFromDirectory((Resolve-Path -LiteralPath $folder), (Join-Path $PWD $zip), 'Optimal', $true)
-          $digest = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
-          "$digest  $([IO.Path]::GetFileName($zip))" | Set-Content -LiteralPath "$zip.sha256" -Encoding ascii
+          $bootstrap = Join-Path $env:RUNNER_TEMP 'innosetup-6.7.4.exe'
+          Invoke-WebRequest 'https://github.com/jrsoftware/issrc/releases/download/is-6_7_4/innosetup-6.7.4.exe' -OutFile $bootstrap
+          if ((Get-FileHash -LiteralPath $bootstrap -Algorithm SHA256).Hash -ne 'A549929319F9120716677C685535CA4671E4B937B5FDC87E2585F32D8EB30E8C') {
+              throw 'Inno Setup compiler checksum mismatch.'
+          }
+          $compiler = Join-Path $env:RUNNER_TEMP 'inno-compiler'
+          $process = Start-Process -FilePath $bootstrap -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CURRENTUSER /NOICONS /DIR=`"$compiler`"" -WindowStyle Hidden -Wait -PassThru
+          if ($process.ExitCode -ne 0) { exit $process.ExitCode }
+          $payload = (Resolve-Path -LiteralPath $folder).Path
+          $artifacts = (New-Item -ItemType Directory -Path 'installer-output').FullName
+          & (Join-Path $compiler 'ISCC.exe') "/DReleaseName=$env:RELEASE_NAME" "/DReleaseVersion=$env:RELEASE_VERSION" "/DPayloadDir=$payload" "/DArtifactDir=$artifacts" packaging/windows-installer.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verify install, launch, worker communication, and uninstall
+        shell: pwsh
+        run: |
+          @'
+          import os, struct, subprocess, tempfile, time
+          from pathlib import Path
+          from liverecorder.catalog import Catalog
+          from liverecorder.recording.supervisor import Supervisor
+          from liverecorder.settings import PlatformSettings, WindowsCredentials
+
+          def run(args, **kwargs):
+              return subprocess.run(args, check=True, timeout=90, creationflags=subprocess.CREATE_NO_WINDOW, **kwargs)
+
+          def subsystem(exe):
+              with exe.open("rb") as image:
+                  image.seek(60)
+                  offset, = struct.unpack("<I", image.read(4))
+                  image.seek(offset + 92)
+                  return struct.unpack("<H", image.read(2))[0]
+
+          name = os.environ["RELEASE_NAME"]
+          setup = Path("installer-output").resolve() / f"{name}-Windows-x64-Setup.exe"
+          root = Path(tempfile.mkdtemp(dir=os.environ["RUNNER_TEMP"]))
+          app, data, videos = (root / part for part in ("installed", "profile", "videos"))
+          run([setup, "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/NOICONS",
+               "/LANG=chinesesimp", f"/DIR={app}", f"/LOG={root / 'install.log'}"])
+          gui, worker = app / f"{name}.exe", app / "LiveRecorderWorker.exe"
+          assert subsystem(gui) == 2 and subsystem(worker) == 3
+          assert (app / "third-party" / "qt" / "LGPL-3.0-only.txt").is_file()
+          plugins = run([worker, "--check-plugins"], capture_output=True, text=True).stdout
+          assert {line.split()[0] for line in plugins.splitlines()} == {"bilibili", "douyu", "huya", "douyin", "youtube", "twitch"}
+          os.environ["QT_QPA_PLATFORM"] = "offscreen"
+          run([gui, "--smoke-test", "--data-dir", data, "--recordings-dir", videos])
+          catalog = data / "library.sqlite3"
+          assert catalog.is_file()
+          with Catalog(catalog) as db:
+              room = db.save_room("twitch", "fixture", "Smoke fixture")
+          PlatformSettings(data / "platforms", WindowsCredentials()).save("twitch", {"proxy": "http://127.0.0.1:1"})
+          fixture_tool = root / "unused-tool.exe"
+          with Supervisor(lambda room_id: [str(worker), "--recording-worker", str(room_id), str(data),
+                                           str(videos), str(fixture_tool), str(fixture_tool)], stop_timeout=15) as supervisor:
+              assert supervisor.start(room.id)
+              seen = set()
+              end = time.monotonic() + 15
+              while time.monotonic() < end and "checking" not in seen:
+                  seen.update(event.state for event in supervisor.events())
+                  time.sleep(0.05)
+              assert "checking" in seen, seen
+              supervisor.stop(room.id)
+              end = time.monotonic() + 14
+              while supervisor.pending(room.id) and time.monotonic() < end:
+                  seen.update(event.state for event in supervisor.events())
+                  time.sleep(0.05)
+              assert "stopped" in seen and "failed" not in seen, seen
+          videos.mkdir(exist_ok=True)
+          saved = videos / "recording.fixture"
+          saved.write_bytes(b"keep this recording")
+          marker = data / "config.fixture"
+          marker.write_bytes(b"keep this profile")
+          run([next(app.glob("unins*.exe")), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
+               f"/LOG={root / 'uninstall.log'}"])
+          for attempt in range(100):
+              if not gui.exists() and not worker.exists():
+                  break
+              time.sleep(0.1)
+          assert not gui.exists() and not worker.exists()
+          assert catalog.is_file() and saved.read_bytes() == b"keep this recording"
+          assert marker.read_bytes() == b"keep this profile"
+          print("Install, windowed startup, worker pipe start/stop, and data-preserving uninstall passed.")
+          '@ | python -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $setup = "installer-output/$env:RELEASE_NAME-Windows-x64-Setup.exe"
+          $digest = (Get-FileHash -LiteralPath $setup -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$digest  $([IO.Path]::GetFileName($setup))" | Set-Content -LiteralPath "$setup.sha256" -Encoding ascii
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-installer
+          path: installer-output/*
+          if-no-files-found: error
+          retention-days: 7
       - name: Publish GitHub Release
+        if: github.ref_type == 'tag'
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          $zip = "dist/$env:RELEASE_NAME-Windows-x64.zip"
-          gh release create $env:GITHUB_REF_NAME $zip "$zip.sha256" --verify-tag --title "原画直播录制 $env:GITHUB_REF_NAME" --notes "Windows x64 免安装版本。下载并解压整个目录；录制和压缩需要系统 PATH 中的 FFmpeg 与 FFprobe。首次使用请先对已获授权的直播间试录。"
+          # Existing releases are never overwritten by automation.
+          $setup = "installer-output/$env:RELEASE_NAME-Windows-x64-Setup.exe"
+          $existing = gh release view $env:GITHUB_REF_NAME --json tagName --jq .tagName 2>$null
+          if ($LASTEXITCODE -eq 0 -and $existing -eq $env:GITHUB_REF_NAME) { exit 0 }
+          gh release create $env:GITHUB_REF_NAME $setup "$setup.sha256" --verify-tag --title "原画直播录制 $env:GITHUB_REF_NAME" --notes "Windows x64 安装版。双击安装，无需解压。仅录制和压缩需要 FFmpeg 与 FFprobe。卸载保留用户配置和录像。"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

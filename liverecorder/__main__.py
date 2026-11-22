@@ -27,7 +27,9 @@ def main():
     args = parser.parse_args()
     if args.check_plugins:
         for platform in PLATFORMS:
-            print(platform, adapter_for(platform).plugin_class().__name__)
+            plugin = adapter_for(platform).plugin_class()
+            if sys.stdout is not None:
+                print(platform, plugin.__name__)
         return 0
     app = QApplication([])
     app.setApplicationName("LiveRecorder Desktop")

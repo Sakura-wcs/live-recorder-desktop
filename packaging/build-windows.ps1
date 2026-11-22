@@ -13,19 +13,13 @@ try {
     $livePython = (Get-Command $livePython -ErrorAction Stop).Source
     # Avoid repackaging unrelated toolchain DLLs found on this machine's application PATH.
     $env:PATH = "$(Split-Path -Parent $livePython);$([Environment]::SystemDirectory);$env:WINDIR"
-    $liveDependencies = @()
+    $env:LIVE_BUILD_NAME = $ReleaseName
+    $env:LIVE_BUILD_ROOT = $liveProject
     if (Test-Path -LiteralPath '.runtime\deps\streamlink') {
-        $liveDependencies = @('--paths', (Resolve-Path -LiteralPath '.runtime\deps').Path)
-        $env:PYTHONPATH = $liveDependencies[1]
+        $env:PYTHONPATH = (Resolve-Path -LiteralPath '.runtime\deps').Path
     }
-    $livePlugins = foreach ($livePlatform in @('bilibili','douyu','huya','douyin','youtube','twitch')) {
-        '--hidden-import'
-        "streamlink.plugins.$livePlatform"
-    }
-    $liveOptions = @('-m','PyInstaller','--noconfirm','--onedir','--console','--name',$ReleaseName,
-        '--specpath',$liveBuild,'--distpath',(Join-Path $liveProject 'dist'),'--workpath',(Join-Path $liveProject 'build'),
-        '--paths',$liveProject,'--collect-data','streamlink','--noupx')
-    & $livePython @liveOptions @liveDependencies @livePlugins 'packaging/windows_entry.py'
+    & $livePython -m PyInstaller --noconfirm --distpath (Join-Path $liveProject 'dist') `
+        --workpath (Join-Path $liveProject 'build') 'packaging/windows.spec'
     if ($LASTEXITCODE -ne 0) { throw "PyInstaller exited with code $LASTEXITCODE" }
 } finally {
     Pop-Location

@@ -555,8 +555,9 @@ class MainWindow(QMainWindow):
         ffmpeg, ffprobe = shutil.which("ffmpeg"), shutil.which("ffprobe")
         if not (ffmpeg and ffprobe):
             raise ValueError("未找到 FFmpeg 和 FFprobe，请将两者加入 PATH。")
-        launch = ["--recording-worker"] if getattr(sys, "frozen", False) else ["-m", "liverecorder.recording.entry"]
-        return [sys.executable, *launch, str(room_id),
+        launch = ([str(Path(sys.executable).with_name("LiveRecorderWorker.exe")), "--recording-worker"]
+                  if getattr(sys, "frozen", False) else [sys.executable, "-m", "liverecorder.recording.entry"])
+        return [*launch, str(room_id),
                 str(self.paths.root), str(self.recordings), ffmpeg, ffprobe, "--container", self.container]
 
     def _start(self, room=None):
