@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "liverecorder-desktop"
+version = "0.1.3"
+requires-python = ">=3.11"
+dependencies = [
+    "pywin32>=306; sys_platform == 'win32'",
+    "streamlink>=8.6.3,<8.7",
+    "PySide6>=6.11.1,<7",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "pytest-qt>=4.4"]
+
+[tool.setuptools.packages.find]
+include = ["liverecorder*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--basetemp=.test-data/pytest"

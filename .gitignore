@@ -1,0 +1,11 @@
+__pycache__/
+.pytest_cache/
+.test-data/*
+!.test-data/.gitkeep
+.venv/
+.runtime/
+*.egg-info/
+build/
+dist/
+/Recordings/
+/backups/

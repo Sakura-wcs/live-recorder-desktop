@@ -1,0 +1,72 @@
+name: Build and release Windows
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  windows:
+    runs-on: windows-2025
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.14'
+          architecture: x64
+      - name: Validate version and install build dependencies
+        shell: pwsh
+        run: |
+          $version = python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])"
+          if ($LASTEXITCODE -ne 0 -or $version -notmatch '^\d+\.\d+\.\d+$' -or $env:GITHUB_REF_NAME -cne "v$version") {
+              throw 'Release tag and pyproject version must match.'
+          }
+          "RELEASE_NAME=LiveRecorderDesktop-$version" >> $env:GITHUB_ENV
+          python -m pip install . "streamlink==8.6.3" "PySide6==6.11.1" "pywin32==311" "PyInstaller==6.19.0" "pyinstaller-hooks-contrib==2026.4"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python -m pip check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build and smoke-test
+        shell: pwsh
+        run: |
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File packaging/build-windows.ps1 -ReleaseName $env:RELEASE_NAME
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $exe = Join-Path "dist/$env:RELEASE_NAME" "$env:RELEASE_NAME.exe"
+          & $exe --check-plugins
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:QT_QPA_PLATFORM = 'offscreen'
+          & $exe --smoke-test --data-dir "$env:RUNNER_TEMP/smoke-data" --recordings-dir "$env:RUNNER_TEMP/smoke-videos"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (!(Test-Path -LiteralPath "$env:RUNNER_TEMP/smoke-data/library.sqlite3")) { throw 'Smoke test did not initialize a catalog.' }
+      - name: Include notices and archive release
+        shell: pwsh
+        run: |
+          $folder = "dist/$env:RELEASE_NAME"
+          Copy-Item -LiteralPath README.md,LICENSE.md,THIRD-PARTY.md -Destination $folder
+          $notices = Join-Path $folder 'third-party'
+          python packaging/dependency-notices.py $notices
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Copy-Item -LiteralPath packaging/licenses/qt -Destination $notices -Recurse
+          $zip = "dist/$env:RELEASE_NAME-Windows-x64.zip"
+          [System.IO.Compression.ZipFile]::CreateFromDirectory((Resolve-Path -LiteralPath $folder), (Join-Path $PWD $zip), 'Optimal', $true)
+          $digest = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$digest  $([IO.Path]::GetFileName($zip))" | Set-Content -LiteralPath "$zip.sha256" -Encoding ascii
+      - name: Publish GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $zip = "dist/$env:RELEASE_NAME-Windows-x64.zip"
+          gh release create $env:GITHUB_REF_NAME $zip "$zip.sha256" --verify-tag --title "原画直播录制 $env:GITHUB_REF_NAME" --notes "Windows x64 免安装版本。下载并解压整个目录；录制和压缩需要系统 PATH 中的 FFmpeg 与 FFprobe。首次使用请先对已获授权的直播间试录。"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
