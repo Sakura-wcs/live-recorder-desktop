@@ -62,6 +62,11 @@ jobs:
           $compiler = Join-Path $env:RUNNER_TEMP 'inno-compiler'
           $process = Start-Process -FilePath $bootstrap -ArgumentList "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CURRENTUSER /NOICONS /DIR=`"$compiler`"" -WindowStyle Hidden -Wait -PassThru
           if ($process.ExitCode -ne 0) { exit $process.ExitCode }
+          $language = Join-Path $compiler 'Languages/ChineseSimplified.isl'
+          Invoke-WebRequest 'https://raw.githubusercontent.com/jrsoftware/issrc/is-6_7_4/Files/Languages/Unofficial/ChineseSimplified.isl' -OutFile $language
+          if ((Get-FileHash -LiteralPath $language -Algorithm SHA256).Hash -ne '7D544B9BB1D142CFA11F2E5D3CC8ABE2E55F8E066C5124E3772675AA236E1278') {
+              throw 'Inno Setup language checksum mismatch.'
+          }
           $payload = (Resolve-Path -LiteralPath $folder).Path
           $artifacts = (New-Item -ItemType Directory -Path 'installer-output').FullName
           & (Join-Path $compiler 'ISCC.exe') "/DReleaseName=$env:RELEASE_NAME" "/DReleaseVersion=$env:RELEASE_VERSION" "/DPayloadDir=$payload" "/DArtifactDir=$artifacts" packaging/windows-installer.iss
