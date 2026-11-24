@@ -88,11 +88,14 @@ class MainWindow(QMainWindow):
         self.recording = RecordingService(self.catalog, self._command, self.room_limit)
         self.supervisor = self.recording.supervisor
         interrupted = self.catalog.flag_interrupted_batches()
-        recovered = RecordingJournal(self.catalog).reconcile()
+        startup_journal = RecordingJournal(self.catalog)
+        recovered = startup_journal.reconcile()
+        startup_journal.flag_interrupted()
         self.allow_close = False
         self.exiting = False
         self.file_operation = False
         self.room_states = {}
+        self.seal_errors = {}
         self.visible_rooms = []
         self.setWindowTitle("LiveRecorder Desktop")
         self.setMinimumSize(730, 520)
@@ -159,6 +162,7 @@ class MainWindow(QMainWindow):
         self.container_picker.addItems(["MKV", "MP4"])
         self.container_picker.setCurrentText(self.container.upper())
         self.container_picker.setAccessibleName("录像封装格式")
+        self.container_picker.setToolTip("MKV：实时无损封装，正常结束只保留一个 MKV。MP4：兼容模式，先保存录制流，再封装。")
         self.container_picker.currentTextChanged.connect(self._set_container)
         directory.addWidget(self.container_picker)
         layout.addLayout(directory)
@@ -381,10 +385,18 @@ class MainWindow(QMainWindow):
         selected = {room.id for room in self._selected_rooms()}
         term = self.search.text().strip().casefold()
         all_rooms = self.catalog.rooms()
+        failed_seals = RecordingJournal(self.catalog).seal_failure_rooms()
+
+        def room_status(room_id):
+            state = self.room_states.get(room_id, "未启动")
+            if room_id not in failed_seals and room_id not in self.seal_errors:
+                return state
+            return f"有片段待恢复 · {state}"
+
         self.visible_rooms = [room for room in all_rooms
                               if term in f"{room.name} {NAMES[room.platform]} {room.identity}".casefold()]
         self.room_model.replace(
-            (room.name or f"{room.identity}（待补名）", NAMES[room.platform], room.identity, self.room_states.get(room.id, "未启动"),
+            (room.name or f"{room.identity}（待补名）", NAMES[room.platform], room.identity, room_status(room.id),
              "停止此房间" if self.supervisor.active(room.id) else "启动此房间")
             for room in self.visible_rooms
         )
@@ -476,12 +488,24 @@ class MainWindow(QMainWindow):
         if self.exiting or self.file_operation or self.supervisor.pending() or self.compression.busy:
             self.status.setText("请先停止监控与压缩，再恢复未完成录像。")
             return
-        items = RecordingJournal(self.catalog).retryable()[:100]
+        try:
+            journal = RecordingJournal(self.catalog)
+            reconciled = journal.reconcile()
+            journal.flag_interrupted()
+            self.seal_errors.clear()
+            self._refresh_rooms()
+            if reconciled:
+                self._refresh_history()
+            items = journal.retryable()[:100]
+        except (OSError, ValueError, sqlite3.Error):
+            self.status.setText("暂时无法核对待恢复录像，磁盘文件未改动。")
+            return
         if not items:
-            self.status.setText("未发现身份可核实且可以重试封装的原始片段。")
+            self.status.setText(f"已补登 {reconciled} 个已封装成品。" if reconciled else
+                                "未发现身份可核实且可以重试封装的原始片段。")
             return
         labels = [f"{item.id} · {item.raw.name}" for item in items]
-        picked, ok = QInputDialog.getItem(self, "恢复未完成录像", "选择片段（不会删除原始文件）", labels, 0, False)
+        picked, ok = QInputDialog.getItem(self, "恢复未完成录像", "选择片段（完整 MKV 可直接改名，需抢救的原片会保留）", labels, 0, False)
         if not ok:
             return
         item = items[labels.index(picked)]
@@ -494,7 +518,9 @@ class MainWindow(QMainWindow):
                     return RecordingJournal(db).recover(item, *tools)
 
             target = self._run_file_operation("恢复封装", work)
-            self.status.setText(f"已恢复：{target.name}。原始片段已保留。")
+            self.status.setText(f"已恢复：{target.name}。")
+            self.seal_errors.pop(item.room_id, None)
+            self._refresh_rooms()
             self._refresh_history()
         except (OSError, ValueError, RuntimeError, sqlite3.Error) as error:
             self.status.setText(f"恢复未完成，原片保留：{error}")
@@ -766,9 +792,17 @@ class MainWindow(QMainWindow):
         events = self.supervisor.events()
         if events:
             for event in events:
-                if event.state == "name_filled":
+                if event.state in {"name_filled", "live_published"}:
                     self._refresh_history()
                     continue
+                if event.state == "live_sealing":
+                    self.status.setText(event.message)
+                    continue
+                if event.state in {"seal_failed", "live_seal_failed"}:
+                    self.seal_errors[event.room_id] = event.message
+                    self.status.setText(f"{event.message}。可在「录像历史」恢复未完成录像。")
+                    if event.state == "live_seal_failed":
+                        continue
                 self.room_states[event.room_id] = event.message
                 if event.state == "finished":
                     self._refresh_history()

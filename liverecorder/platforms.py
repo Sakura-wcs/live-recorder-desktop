@@ -310,7 +310,7 @@ class Adapter:
             keep_session = True
             return opened, extension, title
         except NoStreamsError:
-            return None
+            raise PlatformFailure("retrying", "平台曾返回直播流，但暂时无法打开，将重试。") from None
         except (StreamlinkError, RequestException) as error:
             raise _platform_failure(error) from None
         finally:

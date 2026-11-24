@@ -39,7 +39,9 @@ class Supervisor:
         self._stop_timeout = stop_timeout
         self._active = {}
         self._deadlines = {}
+        self._forced = set()
         self._phases = {}
+        self._live_sealing = set()
         self._events = SimpleQueue()
 
     def start(self, room_id: int) -> bool:
@@ -87,7 +89,9 @@ class Supervisor:
         return bool(self._active) if room_id is None else room_id in self._active
 
     def _timeout(self, room_id):
-        return 1260 if self._phases.get(room_id) == "finalizing" else self._stop_timeout
+        if self._phases.get(room_id) == "finalizing":
+            return 1860
+        return max(55, self._stop_timeout) if room_id in self._live_sealing else self._stop_timeout
 
     def stop(self, room_id: int) -> None:
         if not self.active(room_id) or room_id in self._deadlines:
@@ -104,6 +108,7 @@ class Supervisor:
         for room_id, (process, reader, job) in list(self._active.items()):
             deadline = self._deadlines.get(room_id)
             if deadline is not None and time.monotonic() >= deadline and process.poll() is None:
+                self._forced.add(room_id)
                 if job is not None:
                     job.Close()
                     self._active[room_id] = process, reader, None
@@ -123,8 +128,12 @@ class Supervisor:
             self._active.pop(room_id)
             self._deadlines.pop(room_id, None)
             self._phases.pop(room_id, None)
-            state = "stopped" if process.returncode == 0 else "failed"
-            message = "监控已停止" if state == "stopped" else "工作进程异常结束，可检查未完成文件"
+            self._live_sealing.discard(room_id)
+            forced = room_id in self._forced
+            self._forced.discard(room_id)
+            state = "stopped" if process.returncode == 0 and not forced else "failed"
+            message = ("停止等待超时，工作进程已强制结束，请检查未完成文件" if forced else
+                       "监控已停止" if state == "stopped" else "工作进程异常结束，可检查未完成文件")
             self._events.put(RoomEvent(room_id, state, message))
 
     def events(self) -> list[RoomEvent]:
@@ -136,7 +145,12 @@ class Supervisor:
                     event = self._events.get_nowait()
                 except Empty:
                     return
-                if event.state == "name_filled":
+                if event.state in {"name_filled", "live_published", "live_sealing", "live_seal_failed"}:
+                    if event.state == "live_sealing" and event.room_id in self._active:
+                        self._live_sealing.add(event.room_id)
+                        if event.room_id in self._deadlines:
+                            self._deadlines[event.room_id] = max(
+                                self._deadlines[event.room_id], time.monotonic() + self._timeout(event.room_id))
                     events.append(event)
                     continue
                 past = self._phases.get(event.room_id)

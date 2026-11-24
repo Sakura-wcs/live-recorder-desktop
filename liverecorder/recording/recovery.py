@@ -1,4 +1,4 @@
-"""Durable capture intent; recovery never removes media."""
+"""Durable capture intent; recovery preserves existing media."""
 
 import json
 import os
@@ -9,7 +9,8 @@ from pathlib import Path
 
 from ..catalog import file_identity
 from ..paths import checked_path, require_recording_volume
-from .media import finalize
+from .live_media import quick_check
+from .media import RemuxError, finalize
 
 
 @contextmanager
@@ -77,12 +78,27 @@ class RecordingJournal:
         with self.db:
             self.db.execute("UPDATE recording_sessions SET state='finished' WHERE id=?", (session,))
 
+    def mark_seal_failed(self, session):
+        with self.db:
+            self.db.execute("UPDATE recording_sessions SET state='seal_failed' WHERE id=? AND state IN ('capturing','prepared')",
+                            (session,))
+
+    def seal_failure_rooms(self):
+        return {row[0] for row in self.db.execute("SELECT DISTINCT room_id FROM recording_sessions WHERE state='seal_failed'")}
+
+    def flag_interrupted(self):
+        """Call only while no capture workers are running for this catalog."""
+        with self.db:
+            self.db.executemany("UPDATE recording_sessions SET state='seal_failed' "
+                                "WHERE id=? AND state IN ('capturing','prepared')",
+                                [(item.id,) for item in self.retryable()])
+
     def pending(self):
         return [Session(row[0], row[1], Path(row[2]), Path(row[3]), tuple(json.loads(row[4])),
                         tuple(json.loads(row[5])) if row[5] else None)
                 for row in self.db.execute(
                     "SELECT id,room_id,raw,target,raw_stamp,output_stamp FROM recording_sessions "
-                    "WHERE state IN ('capturing','prepared') ORDER BY id DESC")]
+                    "WHERE state IN ('capturing','prepared','seal_failed') ORDER BY id DESC")]
 
     def reconcile(self):
         count = 0
@@ -106,6 +122,7 @@ class RecordingJournal:
     def recover(self, item, ffmpeg, ffprobe):
         require_recording_volume(item.raw)
         require_recording_volume(item.target)
+        direct = item.raw.name.endswith(".live.partial.mkv") and item.target.suffix.lower() == ".mkv"
         with _pin_source(item.raw):
             stamp = file_identity(item.raw)
             if not self._retryable(item) or not stamp or stamp[:2] != item.raw_stamp[:2]:
@@ -117,6 +134,29 @@ class RecordingJournal:
                     raise ValueError("原片在封装期间发生变化")
                 self.prepare(item.id, output_stamp)
 
-            return finalize(item.raw, item.target, ffmpeg, ffprobe, before_publish=prepare,
-                            on_published=lambda path, output_stamp: self.complete(item.id, item.room_id, path, output_stamp),
-                            guard=require_recording_volume)
+            ready = False
+            if direct:
+                try:
+                    quick_check(item.raw, ffprobe)
+                except RemuxError:
+                    pass  # Remux readable packets; keep the damaged original.
+                else:
+                    prepare(stamp)
+                    ready = True
+            if not ready:
+                return finalize(item.raw, item.target, ffmpeg, ffprobe, before_publish=prepare,
+                                on_published=lambda path, output_stamp: self.complete(item.id, item.room_id, path, output_stamp),
+                                guard=require_recording_volume,
+                                salvage_check=quick_check if direct else None)
+        # Windows refuses rename while the restrictive read handle is open.
+        raw = require_recording_volume(item.raw)
+        target = require_recording_volume(item.target)
+        if file_identity(raw) != stamp or not self._retryable(item):
+            raise ValueError("录像在检查后发生变化，请重试")
+        if os.name == "nt":
+            raw.rename(target)
+        else:
+            os.link(raw, target)
+            raw.unlink()
+        self.complete(item.id, item.room_id, target, stamp)
+        return target

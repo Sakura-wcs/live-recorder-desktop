@@ -12,6 +12,7 @@ from ..paths import AppPaths, require_recording_volume
 from ..platforms import adapter_for
 from ..settings import PlatformSettings, WindowsCredentials
 from ..streamlink_compat import configure_hidden_ffmpeg
+from .live_worker import record_live_loop
 from .recovery import RecordingJournal
 from .worker import record_loop, serve
 
@@ -86,9 +87,13 @@ def main():
             with Catalog(paths.catalog) as catalog:
                 yield RecordingJournal(catalog)
 
-        record_loop(stop, emit, open_stream, root, room.display_name, room.platform, room.id,
-                    args.ffmpeg, args.ffprobe, container="." + args.container, on_directory_created=register,
-                    journal=journal, namespace=namespace, resolve_output=resolve_output)
+        options = dict(on_directory_created=register, journal=journal, namespace=namespace, resolve_output=resolve_output)
+        if args.container == "mkv":
+            record_live_loop(stop, emit, open_stream, root, room.display_name, room.platform, room.id,
+                             args.ffmpeg, args.ffprobe, **options)
+        else:
+            record_loop(stop, emit, open_stream, root, room.display_name, room.platform, room.id,
+                        args.ffmpeg, args.ffprobe, container=".mp4", **options)
 
     serve(room.id, capture)
 
