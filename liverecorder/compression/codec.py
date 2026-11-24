@@ -5,10 +5,11 @@ import threading
 from dataclasses import dataclass
 from fractions import Fraction
 from pathlib import Path
+from time import monotonic
 from uuid import uuid4
 
 from ..paths import checked_path, safe_component, safe_join
-from .scan import OUTPUT_FOLDER, Candidate, Snapshot, inspect, snapshot
+from .scan import OUTPUT_FOLDER, Candidate, ProbeCancelled, Snapshot, inspect, snapshot
 
 ENCODERS = {("hevc", "gpu"): "hevc_nvenc", ("av1", "gpu"): "av1_nvenc",
             ("hevc", "cpu"): "libx265", ("av1", "cpu"): "libsvtav1"}
@@ -48,41 +49,58 @@ class Result:
     message: str = ""
 
 
-def _run(executable, args, cancel, *, progress=None, duration=0.0):
+def _run(executable, args, cancel, *, progress=None, duration=0.0, stall_timeout=180.0):
+    if cancel.is_set():
+        return False
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) | getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
-    options = ["-progress", "pipe:1", "-nostats"] if progress is not None else []
+    options = ["-progress", "pipe:1", "-nostats"]
     with subprocess.Popen(
         [str(executable), "-nostdin", "-v", "error", *options, *args],
-        stdout=subprocess.PIPE if options else subprocess.DEVNULL, text=True, encoding="utf-8",
+        stdout=subprocess.PIPE, text=True, encoding="utf-8",
         errors="replace", stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL, creationflags=flags,
     ) as process:
-        reader = None
-        if progress is not None:
-            def read_progress():
-                values = {}
-                for line in process.stdout:
-                    key, _, value = line.strip().partition("=")
-                    values[key] = value
-                    if key != "progress":
-                        continue
+        last_progress = monotonic()
+
+        def read_progress():
+            nonlocal last_progress
+            values = {}
+            best = {name: -1 for name in ("frame", "out_time_us", "total_size")}
+            for line in process.stdout:
+                key, _, value = line.strip().partition("=")
+                values[key] = value
+                if key != "progress":
+                    continue
+                for name, previous in best.items():
                     try:
-                        seconds = max(0, int(values["out_time_us"])) / 1_000_000
+                        observed = int(values[name])
                     except (ValueError, KeyError):
                         continue
+                    if observed > previous:
+                        best[name] = observed
+                        last_progress = monotonic()
+                if progress is not None and best["out_time_us"] >= 0:
+                    seconds = best["out_time_us"] / 1_000_000
                     done = f"{min(100, seconds / duration * 100):.0f}%" if duration > 0 else f"{seconds:.0f} 秒"
                     progress(f"{done} · {values.get('speed', '—').strip()}")
+                values.clear()
 
-            reader = threading.Thread(target=read_progress, daemon=True)
-            reader.start()
+        reader = threading.Thread(target=read_progress, daemon=True)
+        reader.start()
+        stalled = False
         while process.poll() is None:
             if cancel.wait(0.2):
                 process.kill()
                 break
+            if process.poll() is None and monotonic() - last_progress >= stall_timeout:
+                stalled = True
+                process.kill()
+                break
         process.wait()
-        if reader is not None:
-            reader.join()
+        reader.join()
         if cancel.is_set():
             return False
+        if stalled:
+            raise RuntimeError("FFmpeg 无进度超时，已停止处理；原片保留")
         if process.returncode:
             raise RuntimeError("FFmpeg 处理失败：请检查编码器、源文件和剩余空间")
         return True
@@ -90,7 +108,7 @@ def _run(executable, args, cancel, *, progress=None, duration=0.0):
 
 def preflight(profile, ffmpeg, cancel):
     return _run(ffmpeg, ["-f", "lavfi", "-i", "testsrc2=s=160x90:r=10",
-                         "-frames:v", "2", *profile.args(), "-f", "null", "-"], cancel)
+                         "-frames:v", "2", *profile.args(), "-f", "null", "-"], cancel, stall_timeout=30)
 
 
 def _verify(source, output, codec):
@@ -154,13 +172,15 @@ def encode(candidate, profile, ffmpeg, ffprobe, cancel, *, destination=None, pro
             return Result(candidate, None, None, "cancelled")
         if progress:
             progress("正在校验成品")
-        _verify(inspect(candidate.path, ffprobe, count_frames=True),
-                inspect(staging, ffprobe, count_frames=True), profile.codec)
+        _verify(inspect(candidate.path, ffprobe, count_frames=True, cancel=cancel),
+                inspect(staging, ffprobe, count_frames=True, cancel=cancel), profile.codec)
         if not _run(ffmpeg, ["-xerror", "-i", str(staging), "-map", "0:v", "-map", "0:a?",
                              "-f", "null", "-"], cancel):
             return Result(candidate, None, None, "cancelled")
         if snapshot(candidate.path) != candidate.snapshot:
             raise ValueError("源文件在编码时发生变化")
+        if cancel.is_set():
+            return Result(candidate, None, None, "cancelled")
         out = safe_join(directory, f"{stem}.{profile.codec}.mkv")
         if out.exists():
             out = safe_join(directory, f"{stem}.{profile.codec}.{uuid4().hex[:10]}.mkv")
@@ -172,6 +192,8 @@ def encode(candidate, profile, ffmpeg, ffprobe, cancel, *, destination=None, pro
         published = out
         info = snapshot(out)
         return Result(candidate, out, info, "success" if info.size < candidate.snapshot.size else "no_savings")
+    except ProbeCancelled:
+        return Result(candidate, None, None, "cancelled")
     except (OSError, ValueError, KeyError, subprocess.SubprocessError, RuntimeError, ArithmeticError) as error:
         message = str(error) if isinstance(error, (ValueError, RuntimeError)) else "读取、写入或校验视频失败"
         return Result(candidate, published, None, "failed", message)

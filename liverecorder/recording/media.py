@@ -55,7 +55,8 @@ def probe_video(path: Path, ffprobe: Path) -> tuple:
     return tuple(streams)
 
 
-def finalize(source: Path, target: Path, ffmpeg: Path, ffprobe: Path, *, on_published=None) -> Path:
+def finalize(source: Path, target: Path, ffmpeg: Path, ffprobe: Path, *, on_published=None, before_publish=None,
+             guard=checked_path) -> Path:
     source, target = checked_path(source), checked_path(target)
     formats = {".mkv": "matroska", ".mp4": "mp4"}
     if source == target or target.suffix.lower() not in formats:
@@ -65,21 +66,25 @@ def finalize(source: Path, target: Path, ffmpeg: Path, ffprobe: Path, *, on_publ
     staging = checked_path(target.with_name(f".liverecorder-{uuid4().hex}.partial"))
     owned = False
     try:
-        staging.touch(exist_ok=False)
+        guard(staging).touch(exist_ok=False)
         owned = True
         command = [str(ffmpeg), "-nostdin", "-v", "error", "-xerror", "-y", "-i", str(source),
                    "-map", "0", "-c", "copy", "-f", formats[target.suffix.lower()]]
         if target.suffix.lower() == ".mp4":
             command.extend(["-movflags", "+faststart"])
-        subprocess.run([*command, str(checked_path(staging))], capture_output=True, timeout=600, check=True,
+        subprocess.run([*command, str(guard(staging))], capture_output=True, timeout=600, check=True,
                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        validate_remux(source, staging, ffprobe)
         stamp = file_identity(staging)
-        if stamp is None:
+        validate_remux(source, staging, ffprobe)
+        if stamp is None or file_identity(staging) != stamp:
             raise ValueError("无法校验封装成品身份")
-        checked_path(target)
+        if before_publish:
+            before_publish(stamp)
+        if file_identity(staging) != stamp:
+            raise ValueError("待发布成品已变化")
+        guard(target)
         if os.name == "nt":
-            checked_path(staging).rename(target)  # Windows does not replace an existing destination.
+            guard(staging).rename(guard(target))  # Windows does not replace an existing destination.
         else:
             os.link(checked_path(staging), target)
         if on_published is not None:

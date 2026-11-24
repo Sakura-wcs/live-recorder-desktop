@@ -78,6 +78,7 @@ jobs:
           import os, struct, subprocess, tempfile, time
           from pathlib import Path
           from liverecorder.catalog import Catalog
+          from liverecorder.paths import require_recording_volume
           from liverecorder.recording.supervisor import Supervisor
           from liverecorder.settings import PlatformSettings, WindowsCredentials
 
@@ -110,8 +111,23 @@ jobs:
               room = db.save_room("twitch", "fixture", "Smoke fixture")
           PlatformSettings(data / "platforms", WindowsCredentials()).save("twitch", {"proxy": "http://127.0.0.1:1"})
           fixture_tool = root / "unused-tool.exe"
-          with Supervisor(lambda room_id: [str(worker), "--recording-worker", str(room_id), str(data),
-                                           str(videos), str(fixture_tool), str(fixture_tool)], stop_timeout=15) as supervisor:
+          forbidden = Path("C:/") / f"LiveRecorderDenied-{root.name}"
+          def command(room_id, destination):
+              return [str(worker), "--recording-worker", str(room_id), str(data),
+                      str(destination), str(fixture_tool), str(fixture_tool)]
+          denied = subprocess.run(command(room.id, forbidden), capture_output=True, timeout=15,
+                                  creationflags=subprocess.CREATE_NO_WINDOW)
+          assert denied.returncode != 0 and not forbidden.exists()
+          eligible = None
+          for drive in [root.anchor, *[f"{letter}:/" for letter in "DEFGHIJKLMNOPQRSTUVWXYZ"]]:
+              try:
+                  candidate = require_recording_volume(Path(drive))
+                  eligible = Path(tempfile.mkdtemp(prefix="liverecorder-worker-", dir=candidate))
+                  break
+              except (OSError, ValueError):
+                  continue
+          if eligible is not None:
+            with Supervisor(lambda room_id: command(room_id, eligible), stop_timeout=15) as supervisor:
               assert supervisor.start(room.id)
               seen = set()
               end = time.monotonic() + 15
@@ -125,6 +141,8 @@ jobs:
                   seen.update(event.state for event in supervisor.events())
                   time.sleep(0.05)
               assert "stopped" in seen and "failed" not in seen, seen
+          else:
+              print("No writable non-system drive on runner; the system-volume rejection was verified.")
           videos.mkdir(exist_ok=True)
           saved = videos / "recording.fixture"
           saved.write_bytes(b"keep this recording")
@@ -139,7 +157,7 @@ jobs:
           assert not gui.exists() and not worker.exists()
           assert catalog.is_file() and saved.read_bytes() == b"keep this recording"
           assert marker.read_bytes() == b"keep this profile"
-          print("Install, windowed startup, worker pipe start/stop, and data-preserving uninstall passed.")
+          print("Install, windowed startup, system-volume protection, and data-preserving uninstall passed.")
           '@ | python -
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           $setup = "installer-output/$env:RELEASE_NAME-Windows-x64-Setup.exe"
@@ -161,5 +179,5 @@ jobs:
           $setup = "installer-output/$env:RELEASE_NAME-Windows-x64-Setup.exe"
           $existing = gh release view $env:GITHUB_REF_NAME --json tagName --jq .tagName 2>$null
           if ($LASTEXITCODE -eq 0 -and $existing -eq $env:GITHUB_REF_NAME) { exit 0 }
-          gh release create $env:GITHUB_REF_NAME $setup "$setup.sha256" --verify-tag --title "原画直播录制 $env:GITHUB_REF_NAME" --notes "Windows x64 安装版。双击安装，无需解压。仅录制和压缩需要 FFmpeg 与 FFprobe。卸载保留用户配置和录像。"
+          gh release create $env:GITHUB_REF_NAME $setup "$setup.sha256" --verify-tag --title "原画直播录制 $env:GITHUB_REF_NAME" --notes-file CHANGELOG.md
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

@@ -1,4 +1,5 @@
 import argparse
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -41,16 +42,15 @@ def main():
         if not lock.tryLock(0):
             QMessageBox.warning(None, "无法打开录像库", "请先从系统托盘退出使用同一数据目录的 LiveRecorder，或检查数据目录是否可写。")
             return 1
-        default_media = Path.home() / "Videos" / "LiveRecorder"
         with Catalog(paths.catalog) as catalog:
-            window = MainWindow(paths, catalog, WindowsCredentials(), args.recordings_dir or default_media)
+            window = MainWindow(paths, catalog, WindowsCredentials(), args.recordings_dir)
             with window.supervisor:
                 window.show()
                 if args.smoke_test:
                     window.allow_close = True
                     QTimer.singleShot(300, app.quit)
                 return app.exec()
-    except (OSError, ValueError) as error:
+    except (OSError, ValueError, sqlite3.Error) as error:
         QMessageBox.critical(None, "LiveRecorder 启动失败", str(error))
         return 1
 

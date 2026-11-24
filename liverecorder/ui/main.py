@@ -1,5 +1,4 @@
 import json
-import shutil
 import sqlite3
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -9,14 +8,17 @@ from tempfile import NamedTemporaryFile
 from PySide6.QtCore import QItemSelection, QItemSelectionModel, Qt, QTimer
 from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (QApplication, QComboBox, QDialog, QFileDialog, QFormLayout,
-                               QHBoxLayout, QLabel, QLineEdit, QListWidget, QMainWindow, QMenu, QMessageBox,
+                               QHBoxLayout, QInputDialog, QLabel, QLineEdit, QListWidget, QMainWindow, QMenu, QMessageBox,
                                QPushButton, QSpinBox, QStackedWidget, QStyle, QSystemTrayIcon, QTabWidget,
                                QVBoxLayout, QWidget)
 
 from ..catalog import Catalog
-from ..paths import checked_path, safe_join
+from ..exchange import export_recordings, export_rooms, import_rooms
+from ..media_tools import diagnose_tools, resolve_tools
+from ..paths import checked_path, require_recording_volume, safe_join
 from ..platforms import NAMES, adapter_for
-from ..recording.supervisor import Supervisor
+from ..recording.service import RecordingService
+from ..recording.recovery import RecordingJournal
 from ..rooms import plan_removal, remove_directory
 from ..settings import PlatformSettings
 from .batch_rooms import BatchRoomsDialog
@@ -54,23 +56,39 @@ class FileOperationDialog(QDialog):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, paths, catalog, credential_store, recordings: Path):
+    def __init__(self, paths, catalog, credential_store, recordings: Path | None):
         super().__init__()
         self.paths, self.catalog = paths, catalog
         self.settings = PlatformSettings(paths.platforms, credential_store)
         self.preference_path = safe_join(paths.root, "app.json")
-        self.recordings = paths.recording_root(recordings)
+        self.recordings = paths.recording_root(recordings) if recordings else None
+        self.tool_preferences = {}
+        self.history_before = [None]
+        self.history_pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="recording-history")
+        self.history_future = None
         self.container = "mkv"
         self.room_limit = 8
         self.last_platform = None
+        preferences_error = False
         if self.preference_path.is_file():
-            data = json.loads(self.preference_path.read_text(encoding="utf-8"))
-            if data.get("version") == 1:
-                self.recordings = paths.recording_root(Path(data["recordings"]))
+            try:
+                data = json.loads(self.preference_path.read_text(encoding="utf-8"))
+                if not isinstance(data, dict) or data.get("version") != 1:
+                    raise ValueError("配置版本无效")
+                if data.get("recordings"):
+                    self.recordings = paths.recording_root(Path(data["recordings"]))
+                self.tool_preferences = {key: data[key] for key in ("ffmpeg_path", "ffprobe_path")
+                                         if isinstance(data.get(key), str)}
                 self.container = "mp4" if data.get("container") == "mp4" else "mkv"
                 self.room_limit = max(1, min(32, int(data.get("room_limit", 8))))
                 self.last_platform = data.get("last_platform")
-        self.supervisor = Supervisor(self._command, limit=self.room_limit)
+            except (OSError, ValueError, TypeError):
+                preferences_error = True
+                self.recordings = None
+        self.recording = RecordingService(self.catalog, self._command, self.room_limit)
+        self.supervisor = self.recording.supervisor
+        interrupted = self.catalog.flag_interrupted_batches()
+        recovered = RecordingJournal(self.catalog).reconcile()
         self.allow_close = False
         self.exiting = False
         self.file_operation = False
@@ -104,12 +122,22 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(body)
         self.stack.addWidget(self._recording_page())
         self.compression = CompressionPage(self.catalog, self.paths.catalog)
+        self.compression.tool_preferences = lambda: dict(self.tool_preferences)
         self.stack.addWidget(self.compression)
         self.stack.addWidget(self._platform_page())
         self.nav.currentRowChanged.connect(self.stack.setCurrentIndex)
         self.nav.setCurrentRow(0)
         self._refresh_rooms()
         self._refresh_history()
+        if interrupted or recovered:
+            self.status.setText(f"补登录像 {recovered} 项；中断压缩批次 {interrupted} 个，未重放原片回收。")
+        if preferences_error:
+            self.status.setText("无法读取原录像设置。请选择非系统盘录像目录后再启动任务。")
+        elif self.recordings:
+            try:
+                require_recording_volume(self.recordings)
+            except (OSError, ValueError) as error:
+                self.status.setText(str(error))
         self._setup_tray()
         self.poll = QTimer(self)
         self.poll.setInterval(300)
@@ -119,7 +147,8 @@ class MainWindow(QMainWindow):
     def _recording_page(self):
         widget, layout = page("录制", "保存常用直播间，按房间独立启停。录像保留源画质。")
         directory = QHBoxLayout()
-        self.root_display = QLineEdit(str(self.recordings))
+        self.root_display = QLineEdit(str(self.recordings) if self.recordings else "")
+        self.root_display.setPlaceholderText("请选择非系统盘录像目录（不会回退到 C 盘）")
         self.root_display.setReadOnly(True)
         self.root_display.setAccessibleName("当前录像根目录")
         directory.addWidget(self.root_display, 1)
@@ -169,7 +198,18 @@ class MainWindow(QMainWindow):
         rooms.addWidget(self.room_count)
         tabs.addTab(rooms_widget, "房间")
         self.history_table, self.history_model = table(("主播", "录像路径", "状态"))
-        tabs.addTab(self.history_table, "录像历史")
+        history = QWidget()
+        history_layout = QVBoxLayout(history)
+        history_layout.addWidget(self.history_table, 1)
+        history_tools = QHBoxLayout()
+        for label, callback in (("较新", self._history_newer), ("较早", self._history_older),
+                                ("恢复未完成录像", self._recover_recordings)):
+            button = QPushButton(label)
+            button.clicked.connect(callback)
+            history_tools.addWidget(button)
+        history_tools.addStretch(1)
+        history_layout.addLayout(history_tools)
+        tabs.addTab(history, "录像历史")
         layout.addWidget(tabs, 1)
         self.status = caption("")
         layout.addWidget(self.status)
@@ -177,6 +217,14 @@ class MainWindow(QMainWindow):
         resume.setToolTip("启动上次未手动停止的房间；不是单房操作。")
         resume.clicked.connect(self._resume)
         layout.addWidget(resume, 0, Qt.AlignmentFlag.AlignLeft)
+        exchange = QHBoxLayout()
+        for label, callback in (("导入房间 JSON", self._import_rooms), ("导出房间 JSON", self._export_rooms),
+                                ("导出录像 CSV", self._export_history)):
+            button = QPushButton(label)
+            button.clicked.connect(callback)
+            exchange.addWidget(button)
+        exchange.addStretch(1)
+        layout.addLayout(exchange)
         return widget
 
     def _platform_page(self):
@@ -202,6 +250,12 @@ class MainWindow(QMainWindow):
         form.addRow("平台", self.platform_picker)
         form.addRow("代理", self.proxy)
         form.addRow(self.cookie_label, self.cookie)
+        self.tool_paths = {}
+        for key, label in (("ffmpeg_path", "FFmpeg"), ("ffprobe_path", "FFprobe")):
+            field = QLineEdit(self.tool_preferences.get(key, ""))
+            field.setPlaceholderText("留空使用系统 PATH；或输入完整 EXE 路径")
+            form.addRow(label, field)
+            self.tool_paths[key] = field
         layout.addLayout(form)
         self.settings_notice = caption("")
         layout.addWidget(self.settings_notice)
@@ -209,6 +263,9 @@ class MainWindow(QMainWindow):
         save.setObjectName("primary")
         save.clicked.connect(self._save_platform)
         layout.addWidget(save, 0, Qt.AlignmentFlag.AlignLeft)
+        tools = QPushButton("检测并保存媒体工具")
+        tools.clicked.connect(self._diagnose_media)
+        layout.addWidget(tools, 0, Qt.AlignmentFlag.AlignLeft)
         layout.addStretch(1)
         self.platform_picker.currentIndexChanged.connect(self._load_platform)
         self._load_platform()
@@ -242,13 +299,14 @@ class MainWindow(QMainWindow):
         else:
             self.settings_notice.setText(f"{NAMES[platform]}设置已保存。")
 
-    def _save_preferences(self, recordings, container, *, limit=None, last_platform=None):
+    def _save_preferences(self, recordings, container, *, limit=None, last_platform=None, tools=None):
         new_path = checked_path(self.preference_path)
         staging = None
         try:
             with NamedTemporaryFile("w", encoding="utf-8", dir=new_path.parent, suffix=".tmp", delete=False) as file:
                 staging = Path(file.name)
-                json.dump({"version": 1, "recordings": str(recordings), "container": container,
+                json.dump({"version": 1, "recordings": str(recordings) if recordings else None, "container": container,
+                           **(self.tool_preferences if tools is None else tools),
                            "room_limit": self.room_limit if limit is None else limit,
                            "last_platform": last_platform or self.last_platform},
                           file, ensure_ascii=False)
@@ -258,14 +316,14 @@ class MainWindow(QMainWindow):
                 checked_path(staging).unlink(missing_ok=True)
 
     def _choose_root(self):
-        chosen = QFileDialog.getExistingDirectory(self, "选择录像根目录", str(self.recordings))
+        chosen = QFileDialog.getExistingDirectory(self, "选择录像根目录", str(self.recordings or ""))
         if not chosen:
             return
         try:
-            root = self.paths.recording_root(Path(chosen))
+            root = require_recording_volume(self.paths.recording_root(Path(chosen)))
             self._save_preferences(root, self.container)
-        except (OSError, ValueError):
-            self.status.setText("不能使用该目录。请选可写且不含目录联接的独立文件夹。")
+        except (OSError, ValueError) as error:
+            self.status.setText(f"不能使用该目录：{error}。请选择可写的非系统盘目录。")
             return
         self.recordings = root
         self.root_display.setText(str(root))
@@ -342,11 +400,104 @@ class MainWindow(QMainWindow):
 
     def _refresh_history(self):
         names = {room.id: room.name for room in self.catalog.rooms(include_hidden=True)}
-        self.history_model.replace(
-            (names.get(item.room_id, "未知主播"), str(item.path),
-             "已保存" if item.is_current() else "原文件失联、变更或未登记")
-            for item in reversed(self.catalog.recordings())
-        )
+        entries = self.catalog.recordings(limit=101, before=self.history_before[-1])
+        self.history_next = entries[99].id if len(entries) > 100 else None
+        entries = entries[:100]
+        if self.history_future:
+            self.history_future.cancel()
+        rows = [(names.get(item.room_id, "未知主播"), str(item.path), "正在核对") for item in entries]
+        self.history_model.replace(rows)
+        self.history_future = self.history_pool.submit(lambda: [
+            (name, path, "已保存" if item.is_current() else "原文件失联、变更或未登记")
+            for (name, path, _), item in zip(rows, entries, strict=True)])
+
+    def _history_newer(self):
+        if len(self.history_before) > 1:
+            self.history_before.pop()
+            self._refresh_history()
+
+    def _history_older(self):
+        if self.history_next is not None:
+            self.history_before.append(self.history_next)
+            self._refresh_history()
+
+    def _diagnose_media(self):
+        prefs = {key: field.text().strip() for key, field in self.tool_paths.items()}
+        try:
+            result = self._run_file_operation("检测媒体工具", lambda: diagnose_tools(prefs))
+            self._save_preferences(self.recordings, self.container, tools=prefs)
+        except (OSError, ValueError) as error:
+            self.settings_notice.setText(str(error))
+            return
+        self.tool_preferences = prefs
+        encoders = ", ".join(name for name in ("hevc_nvenc", "av1_nvenc", "libx265", "libsvtav1")
+                             if name in result.encoders) or "未发现支持的编码器"
+        self.settings_notice.setText(f"{result.ffmpeg} · {result.ffmpeg_version}\n"
+                                     f"{result.ffprobe} · {result.ffprobe_version}\n"
+                                     f"编译支持：{encoders}。实际可用性以编码预检为准。")
+
+    def _import_rooms(self):
+        picked, _ = QFileDialog.getOpenFileName(self, "导入房间清单", "", "JSON (*.json)")
+        if not picked:
+            return
+        try:
+            entries = import_rooms(Path(picked))
+            if QMessageBox.question(self, "导入房间", f"读取到 {len(entries)} 个房间。跳过重复项，不自动开始监控。",
+                                    defaultButton=QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
+                self._save_new_rooms(entries)
+        except (OSError, ValueError) as error:
+            self.status.setText(f"导入失败：{error}")
+
+    def _export_rooms(self):
+        picked, _ = QFileDialog.getSaveFileName(self, "导出房间清单", "直播间.json", "JSON (*.json)")
+        if picked:
+            try:
+                count = export_rooms(Path(picked), self.catalog.rooms(), overwrite=True)
+                self.status.setText(f"已导出 {count} 个房间。不包含平台配置或凭据。")
+            except (OSError, ValueError) as error:
+                self.status.setText(f"导出失败：{error}")
+
+    def _export_history(self):
+        picked, _ = QFileDialog.getSaveFileName(self, "导出录像清单", "录像历史.csv", "CSV (*.csv)")
+        if not picked:
+            return
+        catalog_path = self.paths.catalog
+
+        def work():
+            with Catalog(catalog_path) as db:
+                return export_recordings(Path(picked), db.rooms(include_hidden=True), db.recordings(), overwrite=True)
+        try:
+            count = self._run_file_operation("导出录像清单", work)
+            self.status.setText(f"已导出 {count} 条录像，只含文件名，不含目录。")
+        except (OSError, ValueError, sqlite3.Error) as error:
+            self.status.setText(f"导出失败：{error}")
+
+    def _recover_recordings(self):
+        if self.exiting or self.file_operation or self.supervisor.pending() or self.compression.busy:
+            self.status.setText("请先停止监控与压缩，再恢复未完成录像。")
+            return
+        items = RecordingJournal(self.catalog).retryable()[:100]
+        if not items:
+            self.status.setText("未发现身份可核实且可以重试封装的原始片段。")
+            return
+        labels = [f"{item.id} · {item.raw.name}" for item in items]
+        picked, ok = QInputDialog.getItem(self, "恢复未完成录像", "选择片段（不会删除原始文件）", labels, 0, False)
+        if not ok:
+            return
+        item = items[labels.index(picked)]
+        catalog_path = self.paths.catalog
+        try:
+            tools = resolve_tools(self.tool_preferences)
+
+            def work():
+                with Catalog(catalog_path) as db:
+                    return RecordingJournal(db).recover(item, *tools)
+
+            target = self._run_file_operation("恢复封装", work)
+            self.status.setText(f"已恢复：{target.name}。原始片段已保留。")
+            self._refresh_history()
+        except (OSError, ValueError, RuntimeError, sqlite3.Error) as error:
+            self.status.setText(f"恢复未完成，原片保留：{error}")
 
     def _lookup_name(self, platform, identity):
         return adapter_for(platform).lookup_name(identity, self.settings.load(platform))
@@ -552,9 +703,10 @@ class MainWindow(QMainWindow):
             box.exec()
 
     def _command(self, room_id):
-        ffmpeg, ffprobe = shutil.which("ffmpeg"), shutil.which("ffprobe")
-        if not (ffmpeg and ffprobe):
-            raise ValueError("未找到 FFmpeg 和 FFprobe，请将两者加入 PATH。")
+        if not self.recordings:
+            raise ValueError("请先选择非系统盘录像目录，程序不会使用 C 盘作为缓存。")
+        require_recording_volume(self.recordings)
+        ffmpeg, ffprobe = map(str, resolve_tools(self.tool_preferences))
         launch = ([str(Path(sys.executable).with_name("LiveRecorderWorker.exe")), "--recording-worker"]
                   if getattr(sys, "frozen", False) else [sys.executable, "-m", "liverecorder.recording.entry"])
         return [*launch, str(room_id),
@@ -569,12 +721,14 @@ class MainWindow(QMainWindow):
         if self.exiting or self.file_operation or self.supervisor.pending(room.id):
             return
         try:
-            started = self.supervisor.start(room.id)
+            started = self.recording.start(room)
+        except sqlite3.Error:
+            self.status.setText("录像库暂不可写，无法保存监控状态。")
+            return
         except (OSError, ValueError) as error:
             self.status.setText(str(error))
             return
         if started:
-            self.catalog.save_room(room.platform, room.identity, room.name, monitored=True)
             self.room_states[room.id] = "启动中"
             self._refresh_rooms()
         else:
@@ -584,8 +738,10 @@ class MainWindow(QMainWindow):
         if not room:
             room = self._selected_room()
         if room is not None:
-            self.supervisor.stop(room.id)
-            self.catalog.save_room(room.platform, room.identity, room.name, monitored=False)
+            try:
+                self.recording.stop(room)
+            except sqlite3.Error:
+                self.status.setText("任务已收到停止指令，但未能保存停止状态。")
             self.room_states[room.id] = "等待结束" if self.supervisor.active(room.id) else "未启动"
             self._refresh_rooms()
 
@@ -594,10 +750,9 @@ class MainWindow(QMainWindow):
             return
         count = 0
         try:
-            for room in self.catalog.rooms():
-                if room.monitored and self.supervisor.start(room.id):
-                    self.room_states[room.id] = "启动中"
-                    count += 1
+            for room in self.recording.resume():
+                self.room_states[room.id] = "启动中"
+                count += 1
         except (OSError, ValueError) as error:
             self.status.setText(str(error))
         else:
@@ -605,12 +760,14 @@ class MainWindow(QMainWindow):
         self._refresh_rooms()
 
     def _poll(self):
+        if self.history_future and self.history_future.done():
+            self.history_model.replace(self.history_future.result())
+            self.history_future = None
         events = self.supervisor.events()
         if events:
             for event in events:
                 self.room_states[event.room_id] = event.message
-                if event.state == "finished" and event.path is not None:
-                    self.catalog.add_recording(event.room_id, event.path)
+                if event.state == "finished":
                     self._refresh_history()
             self._refresh_rooms()
         if (self.exiting and not self.compression.busy

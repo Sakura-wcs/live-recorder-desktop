@@ -1,5 +1,6 @@
 import logging
 import re
+from contextlib import suppress
 from dataclasses import dataclass
 from http.cookies import SimpleCookie
 from importlib import import_module
@@ -15,6 +16,68 @@ COOKIES = {
     "bilibili": ".bilibili.com", "douyu": ".douyu.com", "huya": ".huya.com",
     "douyin": ".douyin.com", "youtube": ".youtube.com",
 }
+
+
+class PlatformFailure(RuntimeError):
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+class _SessionStream:
+    def __init__(self, stream, http):
+        self.stream, self.http = stream, http
+
+    def read(self, size):
+        from streamlink.exceptions import StreamError
+
+        try:
+            return self.stream.read(size)
+        except StreamError:
+            # The recorder already treats an input I/O fault as a disconnect
+            # and attempts to salvage any data that has been written.
+            raise OSError("直播流读取中断") from None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_):
+        try:
+            # A transport teardown failure must not discard already-read
+            # bytes by suppressing finalization in the recorder.
+            with suppress(OSError):
+                self.stream.close()
+        finally:
+            self.http.close()
+
+
+def _platform_failure(error):
+    from requests.exceptions import RequestException, Timeout, ConnectionError
+    from streamlink.exceptions import FatalPluginError, StreamError
+
+    seen = set()
+    pending = [error]
+    fallback = PlatformFailure("platform", "平台检测或取流失败，请检查平台状态与插件兼容性。")
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, RequestException):
+            status = current.response.status_code if current.response is not None else None
+            if status in {401, 403}:
+                return PlatformFailure("access", "平台拒绝访问，请检查授权、平台配置或网络地区。")
+            if status == 429:
+                return PlatformFailure("rate_limit", "平台请求过于频繁，已暂停后重试。")
+        if isinstance(current, (Timeout, ConnectionError)):
+            return PlatformFailure("network", "平台连接失败或超时，请检查网络或代理。")
+        if isinstance(current, FatalPluginError):
+            fallback = PlatformFailure("access", "平台无法提供直播流，请检查授权与平台配置。")
+        elif isinstance(current, StreamError):
+            fallback = PlatformFailure("network", "直播流无法打开，请检查网络或媒体工具。")
+        pending.extend(item for item in (current.__cause__, current.__context__, *current.args)
+                       if isinstance(item, BaseException))
+    return fallback
 
 
 def normalize_room(platform: str, raw: str) -> str:
@@ -112,7 +175,8 @@ class Adapter:
             return author or None
 
     def detect(self, identity: str, settings: dict, ffmpeg: Path):
-        from streamlink.exceptions import StreamlinkError
+        from requests.exceptions import RequestException
+        from streamlink.exceptions import NoStreamsError, StreamlinkError
         from streamlink.stream.ffmpegmux import MuxedStream
         from streamlink.stream.hls import HLSStream
         from streamlink.stream.hls.hls import MuxedHLSStream
@@ -120,23 +184,34 @@ class Adapter:
         session = self._session(settings, {"http-timeout": 12, "stream-timeout": 15,
                                           "stream-segment-timeout": 12, "ffmpeg-ffmpeg": str(ffmpeg),
                                           "ffmpeg-fout": "matroska"})
+        keep_session = False
         try:
             plugin = self.plugin_class()(session, self.url(identity))
             streams = plugin.streams()
+            if not streams:
+                return None
             stream = streams.get("best")
             if stream is None:
-                return None
+                raise PlatformFailure("unsupported", "平台返回了直播流，但没有可选的录制质量。")
             if self.platform == "youtube" and not isinstance(stream, (HLSStream, MuxedHLSStream)):
                 hls = [item for name, item in streams.items() if name not in {"best", "worst"}
                        and isinstance(item, (HLSStream, MuxedHLSStream))]
                 if not hls:
-                    return None
+                    raise PlatformFailure("unsupported", "YouTube 未提供本版本支持的 HLS 直播流。")
                 stream = hls[-1]
             extension = (".mkv" if isinstance(stream, MuxedStream) else ".ts" if isinstance(stream, HLSStream)
                          else ".flv" if self.platform in {"bilibili", "douyu", "huya", "douyin"} else ".mp4")
-            return stream.open(), extension, plugin.title or identity
-        except StreamlinkError:
-            raise RuntimeError("平台检测或取流失败，可检查代理、凭据与平台状态") from None
+            title = plugin.title or identity
+            opened = _SessionStream(stream.open(), session.http)
+            keep_session = True
+            return opened, extension, title
+        except NoStreamsError:
+            return None
+        except (StreamlinkError, RequestException) as error:
+            raise _platform_failure(error) from None
+        finally:
+            if not keep_session:
+                session.http.close()
 
 
 def adapter_for(platform: str) -> Adapter:

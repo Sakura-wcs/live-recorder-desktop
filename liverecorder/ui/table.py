@@ -22,6 +22,14 @@ class TableModel(QAbstractTableModel):
         self.rows = list(rows)
         self.endResetModel()
 
+    def extend(self, rows):
+        rows = list(rows)
+        if rows:
+            first = len(self.rows)
+            self.beginInsertRows(QModelIndex(), first, first + len(rows) - 1)
+            self.rows.extend(rows)
+            self.endInsertRows()
+
     def rowCount(self, parent=QModelIndex()):
         return len(self.rows) if not parent.isValid() else 0
 

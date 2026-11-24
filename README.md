@@ -11,7 +11,7 @@ Windows 桌面录制工具。支持哔哩哔哩、斗鱼、虎牙、抖音、You
 1. 打开 [Releases](https://github.com/Sakura-wcs/live-recorder-desktop/releases/latest)，在 **Assets（资源）** 中下载 `LiveRecorderDesktop-*-Windows-x64-Setup.exe`。不要下载 GitHub 自动生成的 `Source code (zip)`。
 2. 双击安装包，按向导安装，无需解压。安装完成后，在开始菜单搜索「原画直播录制」启动；桌面快捷方式可在安装时选择。
 
-发行版已包含 Python 和界面所需组件，**启动界面不需要另装 Python、PySide6 或构建工具**。默认配置位于 `%LOCALAPPDATA%\LiveRecorderDesktop`，默认录像位于用户视频文件夹下的 `LiveRecorder`。从 Windows「已安装的应用」卸载只移除软件，不删除用户配置或录像。
+发行版已包含 Python 和界面所需组件，**启动界面不需要另装 Python、PySide6 或构建工具**。默认配置位于 `%LOCALAPPDATA%\LiveRecorderDesktop`。安装版首次录制前须选择非系统盘目录；原始流、封装暂存和成品同目录，不回退到 C 盘。卸载只移除软件，不删除配置或录像。
 
 ### 方式二：下载源码，用 CMD 启动（适合开发或修改代码）
 
@@ -23,15 +23,19 @@ Windows 桌面录制工具。支持哔哩哔哩、斗鱼、虎牙、抖音、You
    .\.venv\Scripts\python.exe -m pip install .
    ```
 
-3. 双击 `启动桌面版.cmd`。**从源码运行不等于构建 EXE**，不需要安装 PyInstaller，也不需要下载发行版。此方式默认将配置和录像分别存放在项目目录的 `.runtime\data` 和 `Recordings`。
+3. 双击 `启动桌面版.cmd`。**从源码运行不等于构建 EXE**，不需要安装 PyInstaller，也不需要下载发行版。配置位于项目目录的 `.runtime\data`；只有项目位于非系统盘时，才可直接使用项目下的 `Recordings` 作为录像目录。
 
 两种方式的默认配置目录不同，房间列表和设置不会自动同步。选择一种长期使用即可。可以在软件里更改录像目录，更改后不会移动旧录像。
 
 ### 两种方式共用：录制与压缩需要 FFmpeg
 
-只打开界面不需要 FFmpeg。需要录制或压缩时，请准备 [FFmpeg](https://ffmpeg.org/download.html)，确保 `ffmpeg.exe` 和 `ffprobe.exe` 都能从系统 PATH 运行；已有则不用重复安装。首次启动不会自动导入原版房间、Cookie 或其他项目配置。平台凭据由 Windows 凭据管理器保存。
+只打开界面不需要 FFmpeg。录制或压缩时可将 [FFmpeg](https://ffmpeg.org/download.html) 的 `ffmpeg.exe` 和 `ffprobe.exe` 加入 PATH，或在「平台设置」中指定路径并检测。平台凭据由 Windows 凭据管理器保存。
 
 ## 录制与压缩
+
+- Windows 发布目标为 x64；构建和验收使用 Windows 2025 运行器及本地 Windows 11。ARM64 原生、其他操作系统和网络录像目录未纳入支持。
+- 在「录像历史」可重试封装身份可核实的未完成片段；恢复不会删除原始片段。压缩中断不会重放原片回收。
+- 可导入或导出房间 JSON、导出录像 CSV，导出不含平台配置、凭据和录像目录。
 
 - 每行的「启动此房间／停止此房间」只控制这一行；上方的「启动选中／停止选中」也只控制选中的一间。「批量恢复上次监控」会重新启动上次未手动停止的房间。
 - 添加房间时可填 ID 或链接。抖音链接中的路径房间号或 live_web_rid 参数会转成数字 ID。名称查询在后台进行，失败可手填。

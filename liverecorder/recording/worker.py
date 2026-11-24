@@ -1,13 +1,16 @@
 import json
 import os
+import random
 import shutil
+import sqlite3
 import sys
 import threading
+from time import monotonic
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
-from ..paths import checked_path, safe_component, safe_join
+from ..paths import checked_path, require_recording_handle, require_recording_volume, safe_component, safe_join
 from .media import finalize
 
 
@@ -54,17 +57,18 @@ def serve(room_id: int, capture) -> None:
 
 def record_loop(stop, emit, open_stream, root, name, platform, room_id, ffmpeg, ffprobe,
                 *, interval=15, min_free_bytes=512 * 1024**2, container=".mkv", on_directory_created=None,
-                on_published=None, namespace=""):
+                on_published=None, namespace="", journal=None):
     delay = interval
     while not stop.is_set():
         partial = None
         try:
+            require_recording_volume(root)
             emit("checking", "正在检测开播")
             opened = open_stream()
             if opened is None:
-                emit("offline", "暂未获取直播流，等待下次检测")
+                emit("offline", "未发现可用直播流（可能尚未开播），等待下次检测")
                 delay = interval
-                stop.wait(interval)
+                stop.wait(interval * random.uniform(1, 1.3))
                 continue
             stream, extension, title = opened
             with stream:
@@ -72,13 +76,22 @@ def record_loop(stop, emit, open_stream, root, name, platform, room_id, ffmpeg, 
                     raise ValueError("无法识别原始直播容器")
                 if stop.is_set():
                     break
+                require_recording_volume(root)
                 directory = output_directory(root, name, platform, room_id, min_free_bytes=min_free_bytes,
                                              on_create=on_directory_created, namespace=namespace)
                 timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
                 stem = f"{timestamp}_{uuid4().hex[:10]}_{safe_component(title)[:40]}"
                 partial = safe_join(directory, stem + ".partial" + extension)
                 target = safe_join(directory, stem + container)
+                require_recording_volume(partial)
                 with partial.open("xb") as output:
+                    require_recording_handle(output, partial)
+                    session = None
+                    if journal:
+                        with journal() as log:
+                            session = log.begin(room_id, partial, target)
+                    next_check = 0
+                    disk_limited = False
                     while not stop.is_set():
                         try:
                             block = stream.read(256 * 1024)
@@ -87,6 +100,14 @@ def record_loop(stop, emit, open_stream, root, name, platform, room_id, ffmpeg, 
                             break
                         if not block:
                             break
+                        now = monotonic()
+                        if now >= next_check:
+                            require_recording_volume(directory)
+                            if shutil.disk_usage(directory).free < min_free_bytes + output.tell() + len(block):
+                                emit("disk_low", "录像盘余量不足，停止写入并尝试封装本段", partial)
+                                disk_limited = True
+                                break
+                            next_check = now + 2
                         first = output.tell() == 0
                         output.write(block)
                         if first:
@@ -95,7 +116,25 @@ def record_loop(stop, emit, open_stream, root, name, platform, room_id, ffmpeg, 
                     original = os.fstat(output.fileno())
             if original.st_size:
                 emit("finalizing", "正在无损封装", partial)
-                published = finalize(partial, target, ffmpeg, ffprobe, on_published=on_published)
+                require_recording_volume(target)
+                if shutil.disk_usage(directory).free < original.st_size + min_free_bytes:
+                    raise OutputSpaceError("录像盘空间不足，已保留未封装片段")
+
+                def prepare(stamp):
+                    require_recording_volume(target)
+                    if journal:
+                        with journal() as log:
+                            log.prepare(session, stamp)
+
+                def commit(path, stamp):
+                    if journal:
+                        with journal() as log:
+                            log.complete(session, room_id, path, stamp)
+                    elif on_published:
+                        on_published(path, stamp)
+
+                published = finalize(partial, target, ffmpeg, ffprobe, on_published=commit, before_publish=prepare,
+                                     guard=require_recording_volume)
                 # Only remove the private staging file created by this recording.
                 try:
                     current = checked_path(partial).stat()
@@ -105,11 +144,20 @@ def record_loop(stop, emit, open_stream, root, name, platform, room_id, ffmpeg, 
                 except (OSError, ValueError):
                     emit("retained", "已生成成品，未能清理本次录制中间文件", partial)
                 emit("finished", "录制成品已写入", published)
+            if disk_limited:
+                raise OutputSpaceError("录像盘余量不足")
             delay = interval
         except OutputSpaceError:
-            emit("retrying", "录制盘空间不足，暂停开始新录像")
-        except (OSError, RuntimeError, ValueError):
-            emit("retrying", "录制或封装未完成，将重试", partial)
-        if stop.wait(delay):
+            emit("disk_low", "录制盘空间不足，暂停开始新录像", partial)
+        except PermissionError:
+            emit("permission", "没有访问录像目录或平台凭据的权限", partial)
+        except sqlite3.Error:
+            emit("database", "录像库暂不可写，已保留磁盘文件", partial)
+        except OSError:
+            emit("io_error", "录像目录或录制工具暂不可访问，已保留磁盘文件", partial)
+        except (RuntimeError, ValueError) as error:
+            code = getattr(error, "code", None)
+            emit(code or "retrying", str(error) if code else "录制或封装未完成，请检查媒体工具与原片", partial)
+        if stop.wait(delay * random.uniform(1, 1.3)):
             break
         delay = min(max(interval, delay * 2), 300)

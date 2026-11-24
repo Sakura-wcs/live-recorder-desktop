@@ -1,6 +1,7 @@
 import json
 import sqlite3
 import stat
+from time import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -43,11 +44,11 @@ class Catalog:
     def __init__(self, path: Path):
         path = checked_path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(checked_path(path))
+        self.db = sqlite3.connect(checked_path(path), timeout=8)
         try:
             self.db.execute("PRAGMA foreign_keys = ON")
             version = self.db.execute("PRAGMA user_version").fetchone()[0]
-            if version > 4:
+            if version > 6:
                 raise ValueError("录像库版本高于当前应用支持的版本")
             if version == 0:
                 self.db.executescript("""
@@ -102,6 +103,31 @@ class Catalog:
                         stamp TEXT NOT NULL
                     );
                     PRAGMA user_version = 4;
+                    COMMIT;
+                """)
+            if version < 5:
+                self.db.executescript("""
+                    BEGIN;
+                    CREATE TABLE recording_sessions (
+                        id INTEGER PRIMARY KEY,
+                        room_id INTEGER NOT NULL REFERENCES rooms(id),
+                        raw TEXT NOT NULL UNIQUE,
+                        target TEXT NOT NULL UNIQUE,
+                        raw_stamp TEXT NOT NULL,
+                        output_stamp TEXT,
+                        state TEXT NOT NULL DEFAULT 'capturing'
+                    );
+                    CREATE INDEX recording_sessions_state ON recording_sessions(state);
+                    PRAGMA user_version = 5;
+                    COMMIT;
+                """)
+            if version < 6:
+                self.db.executescript("""
+                    BEGIN;
+                    CREATE TABLE platform_probe_slots (
+                        platform TEXT PRIMARY KEY, next_at REAL NOT NULL
+                    );
+                    PRAGMA user_version = 6;
                     COMMIT;
                 """)
         except BaseException:
@@ -200,7 +226,7 @@ class Catalog:
                 (room_id, str(path), json.dumps(identity) if identity is not None else None, published_stamp is not None),
             )
 
-    def recordings(self, room_ids: list[int] | None = None) -> list[Recording]:
+    def recordings(self, room_ids: list[int] | None = None, *, limit=None, before=None) -> list[Recording]:
         sql = "SELECT id, room_id, path, identity_stamp, worker_published FROM recordings"
         parameters = ()
         if room_ids is not None:
@@ -208,10 +234,33 @@ class Catalog:
                 return []
             sql += " WHERE room_id IN (SELECT value FROM json_each(?))"
             parameters = (json.dumps(room_ids),)
+        if before is not None:
+            sql += (" WHERE " if room_ids is None else " AND ") + "id < ?"
+            parameters += (before,)
+        sql += " ORDER BY id" if limit is None else " ORDER BY id DESC LIMIT ?"
+        if limit is not None:
+            parameters += (limit,)
         return [
             Recording(row[0], row[1], Path(row[2]), tuple(json.loads(row[3])) if row[3] else None, bool(row[4]))
-            for row in self.db.execute(sql + " ORDER BY id", parameters)
+            for row in self.db.execute(sql, parameters)
         ]
+
+    def flag_interrupted_batches(self):
+        with self.db:
+            return self.db.execute(
+                "UPDATE compression_batches SET state='interrupted' WHERE state='running'"
+            ).rowcount
+
+    def reserve_probe(self, platform, *, spacing=1.5):
+        now = time()
+        with self.db:
+            reserved, = self.db.execute("""
+                INSERT INTO platform_probe_slots VALUES (?, ?)
+                ON CONFLICT(platform) DO UPDATE SET next_at =
+                    min(max(platform_probe_slots.next_at, ?), ? + 60) + ?
+                RETURNING next_at
+                """, (platform, now + spacing, now, now, spacing)).fetchall()[0]
+        return max(0.0, reserved - spacing - now)
 
     def begin_batch(self, codec: str, policy: str) -> int:
         with self.db:

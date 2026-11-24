@@ -2,7 +2,9 @@
 setlocal
 pushd "%~dp0"
 if exist ".runtime\deps\streamlink" set "PYTHONPATH=%~dp0.runtime\deps"
-if exist "dist\LiveRecorderDesktop-0.1.3\LiveRecorderDesktop-0.1.3.exe" (
+if exist "dist\LiveRecorderDesktop-0.2.0\LiveRecorderDesktop-0.2.0.exe" (
+  "dist\LiveRecorderDesktop-0.2.0\LiveRecorderDesktop-0.2.0.exe" --data-dir "%~dp0.runtime\data" --recordings-dir "%~dp0Recordings"
+) else if exist "dist\LiveRecorderDesktop-0.1.3\LiveRecorderDesktop-0.1.3.exe" (
   "dist\LiveRecorderDesktop-0.1.3\LiveRecorderDesktop-0.1.3.exe" --data-dir "%~dp0.runtime\data" --recordings-dir "%~dp0Recordings"
 ) else if exist "dist\LiveRecorderDesktop-0.1.2\LiveRecorderDesktop-0.1.2.exe" (
   "dist\LiveRecorderDesktop-0.1.2\LiveRecorderDesktop-0.1.2.exe" --data-dir "%~dp0.runtime\data" --recordings-dir "%~dp0Recordings"

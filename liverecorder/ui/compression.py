@@ -1,9 +1,9 @@
-import shutil
 import threading
 from html import escape
 from pathlib import Path
+from queue import Empty, Full, Queue
 
-from PySide6.QtCore import QItemSelectionModel, Qt, Signal
+from PySide6.QtCore import QItemSelectionModel, QTimer, Qt, Signal
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFileDialog, QHBoxLayout, QLabel, QLineEdit,
                                QMessageBox, QPushButton, QSpinBox, QVBoxLayout, QWidget)
 
@@ -11,11 +11,13 @@ from ..catalog import Catalog
 from ..compression import Profile, encode, recycle_verified, scan
 from ..compression.codec import preflight
 from ..compression.recycle import eligible, windows_recycle
+from ..media_tools import resolve_tools
 from ..platforms import NAMES
 from .table import table
 
 STATUSES = {
     "ready": "待压缩", "same": "已是目标编码", "unfinished": "录制中或未完成", "invalid": "无法分析",
+    "inaccessible": "无法访问",
     "no_savings": "成品未缩小，原片保留", "success": "已校验成品", "failed": "失败", "cancelled": "已取消",
 }
 
@@ -102,10 +104,11 @@ class CompressionPage(QWidget):
     completed = Signal(object)
     status_changed = Signal(str)
 
-    def __init__(self, catalog, catalog_path):
+    def __init__(self, catalog, catalog_path, *, tool_preferences=None):
         super().__init__()
         self.catalog = catalog
         self.catalog_path = catalog_path
+        self.tool_preferences = tool_preferences or dict
         self.paths = []
         self.expected_files = None
         self.candidates = []
@@ -114,6 +117,11 @@ class CompressionPage(QWidget):
         self.destination = None
         self.busy = False
         self.cancel = threading.Event()
+        self._scan_items = Queue(maxsize=128)
+        self._scan_timer = QTimer(self)
+        self._scan_timer.setInterval(80)
+        self._scan_timer.timeout.connect(self._drain_scan)
+        self._scan_problems = 0
         self.setAccessibleName("视频压缩工作区")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(22, 19, 22, 19)
@@ -146,7 +154,7 @@ class CompressionPage(QWidget):
         layout.addWidget(self.source)
         prefs = QHBoxLayout()
         self.codec = combo([("HEVC / H.265", "hevc"), ("AV1", "av1")])
-        self.device = combo([("GPU · NVIDIA", "gpu"), ("CPU · 软件", "cpu")])
+        self.device = combo([("NVIDIA NVENC", "gpu"), ("CPU · 软件", "cpu")])
         self.preset = combo([("均衡", "balanced"), ("画质优先", "quality"), ("体积优先", "small")])
         self.quality = QSpinBox()
         self.quality.setRange(0, 51)
@@ -285,26 +293,40 @@ class CompressionPage(QWidget):
 
     def _render(self):
         self.visible = [item.classify(self.codec.currentData()) for item in self.candidates if item.path not in self.excluded]
-        self.model.replace((str(item.path), item.video.get("codec_name", "—"),
-                            f"{item.snapshot.size / 1024**2:,.1f} MB" if item.snapshot else "—",
-                            STATUSES[item.state]) for item in self.visible)
+        self.model.replace(self._scan_row(item) for item in self.visible)
         if self.candidates:
             ready = [item for item in self.visible if item.state == "ready"]
-            self.status.setText(f"共 {len(self.visible)} 项，待压缩 {len(ready)} 项 · 源文件合计 "
+            issues = sum(item.state in {"inaccessible", "invalid"} for item in self.visible)
+            self.status.setText(f"共 {len(self.visible)} 项，待压缩 {len(ready)} 项，{issues} 项无法分析 · 源文件合计 "
                                 f"{sum(item.snapshot.size for item in ready) / 1024**3:.2f} GB")
         self._enable()
+
+    @staticmethod
+    def _scan_row(item):
+        return (str(item.path), item.video.get("codec_name", "—"),
+                f"{item.snapshot.size / 1024**2:,.1f} MB" if item.snapshot else "—",
+                STATUSES[item.state] + (f" · {item.message}" if item.message else ""))
+
+    def _drain_scan(self):
+        items = []
+        for _ in range(128):
+            try:
+                items.append(self._scan_items.get_nowait())
+            except Empty:
+                break
+        if items:
+            self.candidates.extend(items)
+            self.model.extend(self._scan_row(item) for item in items)
+            self._scan_problems += sum(item.state in {"inaccessible", "invalid"} for item in items)
+            self.status.setText(f"正在分析… 已检查 {len(self.candidates)} 项，{self._scan_problems} 项无法分析。")
 
     def _omit(self):
         indices = self.view.selectionModel().selectedRows()
         self.excluded.update(self.visible[index.row()].path for index in indices)
         self._render()
 
-    @staticmethod
-    def _tools():
-        ffmpeg, ffprobe = shutil.which("ffmpeg"), shutil.which("ffprobe")
-        if not (ffmpeg and ffprobe):
-            raise ValueError("未找到 FFmpeg 和 FFprobe。请检查 Windows PATH。")
-        return Path(ffmpeg), Path(ffprobe)
+    def _tools(self):
+        return resolve_tools(self.tool_preferences())
 
     def _background(self, fn):
         self.cancel = threading.Event()
@@ -330,9 +352,27 @@ class CompressionPage(QWidget):
             return
         paths, target, recursive = self.paths[:], self.codec.currentData(), self.recursive.isChecked()
         expected = self.expected_files
+        self.candidates.clear()
+        self.visible.clear()
+        self.excluded.clear()
+        self._scan_problems = 0
+        self.model.replace([])
         self.status.setText("正在分析实际编码…")
-        self._background(lambda cancel: ("scan", list(scan(paths, target, ffprobe, cancel,
-                                                          recursive=recursive, expected=expected))))
+
+        def work(cancel):
+            for item in scan(paths, target, ffprobe, cancel, recursive=recursive, expected=expected):
+                while not cancel.is_set():
+                    try:
+                        self._scan_items.put(item, timeout=0.1)
+                        break
+                    except Full:
+                        pass
+                if cancel.is_set():
+                    break
+            return "scan", None
+
+        self._scan_timer.start()
+        self._background(work)
 
     def _encode(self):
         try:
@@ -411,16 +451,18 @@ class CompressionPage(QWidget):
         self._background(work)
 
     def _complete(self, data):
+        scanning = self._scan_timer.isActive()
+        if scanning:
+            self._scan_timer.stop()
+            self._drain_scan()
         self.busy = False
         kind, info = data
         if kind == "scan":
-            self.candidates = info
-            self.excluded.clear()
+            if self.cancel.is_set():
+                self.candidates.clear()
             self._render()
-            if self.cancel.is_set() or not info:
+            if not self.candidates:
                 self.status.setText("扫描已取消，可重新分析。" if self.cancel.is_set() else "没有找到可识别的视频。")
-                self.candidates = []
-                self._render()
         elif kind == "encode":
             results, recycled, retained = info
             self.model.replace((str(item.candidate.path), item.candidate.video.get("codec_name", "—"),
@@ -433,5 +475,8 @@ class CompressionPage(QWidget):
                                 f"{len(recycled)} 项，未完成回收 {len(retained)} 项；重新分析后可启动下一批。")
             self.visible = []
         else:
+            if scanning:
+                self.candidates.clear()
+                self._render()
             self.status.setText(info)
         self._enable()
