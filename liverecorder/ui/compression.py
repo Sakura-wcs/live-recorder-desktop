@@ -242,7 +242,7 @@ class CompressionPage(QWidget):
 
     def _choose_streamers(self):
         candidates = {item.room_id for item in self.catalog.recordings()}
-        picker = StreamerPicker([(room.id, room.platform, room.name) for room in self.catalog.rooms(include_hidden=True)
+        picker = StreamerPicker([(room.id, room.platform, room.display_name) for room in self.catalog.rooms(include_hidden=True)
                                  if room.id in candidates], self)
         if picker.exec() and picker.selected:
             items = self.catalog.recordings(sorted(picker.selected))

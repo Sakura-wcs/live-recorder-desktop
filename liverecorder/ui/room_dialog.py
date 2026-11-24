@@ -3,9 +3,10 @@ from concurrent.futures import ThreadPoolExecutor
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import QComboBox, QDialog, QDialogButtonBox, QFormLayout, QLabel, QLineEdit, QVBoxLayout
 
-from ..platforms import NAMES, normalize_room
+from ..platforms import NAMES, NameLookup, normalize_room
 
 _LOOKUPS = ThreadPoolExecutor(max_workers=2, thread_name_prefix="room-name")
+_FAILED = "自动获取名称失败，请手动填写"
 
 
 class RoomDialog(QDialog):
@@ -22,7 +23,7 @@ class RoomDialog(QDialog):
         self.setWindowTitle("保存直播间")
         self.setMinimumWidth(440)
         layout = QVBoxLayout(self)
-        self.toast = QLabel("自动获取名称失败，请手动填写")
+        self.toast = QLabel(_FAILED)
         self.toast.setStyleSheet("background:#433627;color:#ffe3b2;padding:8px;border-radius:5px;")
         self.toast.setWordWrap(True)
         self.toast.hide()
@@ -40,12 +41,12 @@ class RoomDialog(QDialog):
         self.identifier.setToolTip("平台和房间 ID 共同确定房间；更换房间不会搬动原录像。")
         self.alias = QLineEdit()
         self.alias.setMaxLength(128)
-        self.alias.setPlaceholderText("尝试自动填写，也可手动修改")
+        self.alias.setPlaceholderText("可留空，开始监控后自动补齐")
         if room is not None:
             self.setWindowTitle("编辑直播间")
             self.identifier.setText(room.identity)
             self.alias.setText(room.name)
-            self.manual = True
+            self.manual = bool(room.name)
         self.note = QLabel()
         self.note.setTextFormat(Qt.TextFormat.PlainText)
         self.note.setWordWrap(True)
@@ -62,7 +63,7 @@ class RoomDialog(QDialog):
         self.debounce.timeout.connect(self._request)
         self.poll.timeout.connect(self._collect)
         self.hide_toast.timeout.connect(self.toast.hide)
-        self.deadline.timeout.connect(self._failure)
+        self.deadline.timeout.connect(lambda: self._failure(NameLookup(reason="timeout").notice))
         self.platform.currentIndexChanged.connect(self._changed)
         self.identifier.textChanged.connect(self._changed)
         self.alias.textEdited.connect(self._manual_changed)
@@ -83,6 +84,8 @@ class RoomDialog(QDialog):
         self.toast.hide()
         self.note.clear()
         self.last_requested = None
+        if self.name_edited and not self.alias.text().strip():
+            self.name_edited = self.manual = False
         if self.original_room is not None and not self.name_edited:
             try:
                 same = normalize_room(self.platform.currentData(), self.identifier.text()) == self.original_room.identity
@@ -95,14 +98,12 @@ class RoomDialog(QDialog):
         if self.identifier.text().strip():
             self.debounce.start()
 
-    def _manual_changed(self, text):
+    def _manual_changed(self, _text):
         self.name_edited = True
-        self.manual = bool(text.strip())
-        if self.manual:
-            self.toast.hide()
-            self.note.clear()
-        elif self.last_requested is None and self.identifier.text().strip():
-            self.debounce.start()
+        self.manual = True  # Explicitly clearing a name is also an edit.
+        self._cancel()
+        self.toast.hide()
+        self.note.clear()
 
     def _normalize(self):
         platform = self.platform.currentData()
@@ -127,7 +128,7 @@ class RoomDialog(QDialog):
         self.deadline.start()
 
     def _collect(self):
-        if not self.future.done():
+        if self.future is None or not self.future.done():
             return
         result = self.future
         self._cancel()
@@ -135,18 +136,20 @@ class RoomDialog(QDialog):
         if self.manual:
             return
         try:
-            name = result.result()
+            lookup = result.result()
         except Exception:
-            name = None
+            lookup = NameLookup(reason="platform")
+        name = lookup.name if isinstance(lookup, NameLookup) else lookup
         if isinstance(name, str) and name.strip():
             self.alias.setText(name.strip())
         else:
-            self._failure()
+            self._failure(lookup.notice if isinstance(lookup, NameLookup) else _FAILED)
 
-    def _failure(self):
+    def _failure(self, message):
         self._cancel()
         self.note.clear()
         if not self.manual:
+            self.toast.setText(message)
             self.toast.show()
             self.hide_toast.start()
 
@@ -154,7 +157,7 @@ class RoomDialog(QDialog):
         try:
             self.identity = self._normalize()
             if self.validate is not None:
-                self.validate(*self.identity, self.alias.text().strip() or self.identity[1])
+                self.validate(*self.identity, self.alias.text().strip())
         except ValueError as error:
             self.note.setText(str(error))
             return

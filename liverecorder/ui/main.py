@@ -384,7 +384,7 @@ class MainWindow(QMainWindow):
         self.visible_rooms = [room for room in all_rooms
                               if term in f"{room.name} {NAMES[room.platform]} {room.identity}".casefold()]
         self.room_model.replace(
-            (room.name, NAMES[room.platform], room.identity, self.room_states.get(room.id, "未启动"),
+            (room.name or f"{room.identity}（待补名）", NAMES[room.platform], room.identity, self.room_states.get(room.id, "未启动"),
              "停止此房间" if self.supervisor.active(room.id) else "启动此房间")
             for room in self.visible_rooms
         )
@@ -399,7 +399,7 @@ class MainWindow(QMainWindow):
         self._update_room_buttons()
 
     def _refresh_history(self):
-        names = {room.id: room.name for room in self.catalog.rooms(include_hidden=True)}
+        names = {room.id: room.display_name for room in self.catalog.rooms(include_hidden=True)}
         entries = self.catalog.recordings(limit=101, before=self.history_before[-1])
         self.history_next = entries[99].id if len(entries) > 100 else None
         entries = entries[:100]
@@ -523,7 +523,7 @@ class MainWindow(QMainWindow):
         dialog = RoomDialog(self._lookup_name, self, platform=self.last_platform)
         if dialog.exec():
             key, identity = dialog.identity
-            self._save_new_rooms([(key, identity, dialog.alias.text().strip() or identity)])
+            self._save_new_rooms([(key, identity, dialog.alias.text().strip())])
         dialog.deleteLater()
 
     def _batch_add_rooms(self):
@@ -766,6 +766,9 @@ class MainWindow(QMainWindow):
         events = self.supervisor.events()
         if events:
             for event in events:
+                if event.state == "name_filled":
+                    self._refresh_history()
+                    continue
                 self.room_states[event.room_id] = event.message
                 if event.state == "finished":
                     self._refresh_history()

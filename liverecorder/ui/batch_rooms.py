@@ -5,7 +5,7 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (QDialog, QDialogButtonBox, QHeaderView, QLabel, QPlainTextEdit,
                                QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout)
 
-from ..platforms import NAMES
+from ..platforms import NAMES, NameLookup
 from ..rooms import import_rows
 from .room_dialog import _LOOKUPS
 
@@ -85,7 +85,8 @@ class BatchRoomsDialog(QDialog):
             if not row.status:
                 self.waiting.append(i)
         count = len(self.waiting)
-        self.note.setText(f"{count} 项可添加，{len(self.rows) - count} 项跳过。未获取到的名称可手填，留空则使用 ID。")
+        self.note.setText(f"{count} 项可添加，{len(self.rows) - count} 项跳过。留空保存的名称会在监控时补齐。")
+        self.save.setEnabled(bool(count))
         if count:
             self.timer.start()
             self._collect()
@@ -94,19 +95,21 @@ class BatchRoomsDialog(QDialog):
         for i, (future, deadline) in list(self.running.items()):
             if not future.done() and monotonic() < deadline:
                 continue
-            name = None
+            lookup = NameLookup(reason="timeout")
             try:
                 if future.done():
-                    name = future.result()
+                    lookup = future.result()
                 else:
                     future.cancel()
             except Exception:
-                pass
+                lookup = NameLookup(reason="platform")
             alias = self.grid.item(i, 3)
+            name = lookup.name if isinstance(lookup, NameLookup) else lookup
             found = isinstance(name, str) and bool(name.strip())
             if found and not alias.text().strip():
                 alias.setText(name.strip()[:128])
-            status = "可添加" if found or alias.text().strip() else "未获取名称"
+            notice = lookup.notice if isinstance(lookup, NameLookup) else NameLookup().notice
+            status = "可添加" if found or alias.text().strip() else notice
             self.grid.item(i, 4).setText(status)
             self.grid.item(i, 4).setToolTip(status)
             del self.running[i]
@@ -121,6 +124,6 @@ class BatchRoomsDialog(QDialog):
 
     def accept(self):
         if self.save.isEnabled():
-            self.entries = [(row.platform, row.identity, self.grid.item(i, 3).text().strip()[:128] or row.identity)
+            self.entries = [(row.platform, row.identity, self.grid.item(i, 3).text().strip()[:128])
                             for i, row in enumerate(self.rows) if not row.status]
             super().accept()

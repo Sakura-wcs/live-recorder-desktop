@@ -17,6 +17,10 @@ class Room:
     name: str
     monitored: bool
 
+    @property
+    def display_name(self) -> str:
+        return self.name or self.identity
+
 
 @dataclass(frozen=True)
 class Recording:
@@ -38,6 +42,13 @@ def file_identity(path: Path):
     if not stat.S_ISREG(info.st_mode) or not info.st_ino:
         return None
     return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns
+
+
+def directory_identity(path: Path):
+    info = checked_path(path).lstat()
+    if stat.S_ISDIR(info.st_mode) and info.st_ino:
+        return info.st_dev, info.st_ino, getattr(info, "st_birthtime_ns", 0)
+    return None
 
 
 class Catalog:
@@ -142,8 +153,8 @@ class Catalog:
 
     def save_room(self, platform: str, identity: str, name: str, *, monitored: bool | None = None) -> Room:
         identity, name = identity.strip(), name.strip()
-        if platform not in PLATFORMS or not identity or not name:
-            raise ValueError("需要有效的平台、房间和主播名")
+        if platform not in PLATFORMS or not identity:
+            raise ValueError("需要有效的平台和房间 ID")
         with self.db:
             result = self.db.execute("""
                 INSERT INTO rooms(platform, identity, name, monitored) VALUES (?, ?, ?, coalesce(?, 0))
@@ -153,10 +164,28 @@ class Catalog:
             """, (platform, identity, name, monitored, monitored)).fetchone()
         return Room(*result[:4], bool(result[4]))
 
+    def set_monitored(self, room_id: int, monitored: bool):
+        with self.db:
+            self.db.execute("UPDATE rooms SET monitored=? WHERE id=? AND hidden=0", (monitored, room_id))
+
+    def fill_pending_name(self, room: Room, name: str) -> bool:
+        if not name.strip():
+            return False
+        with self.db:
+            return self.db.execute("""
+                UPDATE rooms SET name=? WHERE id=? AND platform=? AND identity=?
+                    AND hidden=0 AND monitored=1 AND name=''
+            """, (name.strip(), room.id, room.platform, room.identity)).rowcount == 1
+
     def rooms(self, *, include_hidden=False) -> list[Room]:
         query = "SELECT id, platform, identity, name, monitored FROM rooms"
         rows = self.db.execute(query + ("" if include_hidden else " WHERE hidden=0") + " ORDER BY id")
         return [Room(*row[:4], bool(row[4])) for row in rows]
+
+    def visible_room(self, room_id: int) -> Room | None:
+        row = self.db.execute("SELECT id,platform,identity,name,monitored FROM rooms WHERE id=? AND hidden=0",
+                              (room_id,)).fetchone()
+        return Room(*row[:4], bool(row[4])) if row else None
 
     def archive(self, room_ids):
         with self.db:
@@ -196,17 +225,30 @@ class Catalog:
 
     def register_directory(self, room_id, path):
         path = checked_path(path)
-        info = path.lstat()
-        if not stat.S_ISDIR(info.st_mode) or not info.st_ino:
+        identity = directory_identity(path)
+        if identity is None:
             raise ValueError("无法登记目录身份")
         with self.db:
             self.db.execute("INSERT INTO room_directories VALUES(?,?,?) ON CONFLICT(path) DO NOTHING",
-                            (str(path), room_id, json.dumps(
-                                [info.st_dev, info.st_ino, getattr(info, "st_birthtime_ns", 0)])))
+                            (str(path), room_id, json.dumps(identity)))
 
     def owned_directories(self):
         return [(room_id, Path(path), tuple(json.loads(stamp))) for path, room_id, stamp in
                 self.db.execute("SELECT path,room_id,stamp FROM room_directories")]
+
+    def recording_directory(self, room_id: int, root: Path) -> tuple[Path, tuple] | None:
+        for raw, stamp in self.db.execute("SELECT path,stamp FROM room_directories WHERE room_id=? ORDER BY rowid",
+                                          (room_id,)):
+            candidate = Path(raw)
+            if candidate.parent != root:
+                continue
+            try:
+                identity = directory_identity(candidate)
+                if identity is not None and identity == tuple(json.loads(stamp)):
+                    return candidate, identity
+            except (OSError, TypeError, ValueError):
+                continue
+        return None
 
     def forget_directory(self, room_id, directory):
         with self.db:

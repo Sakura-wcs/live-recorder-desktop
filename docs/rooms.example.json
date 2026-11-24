@@ -1,0 +1,36 @@
+{
+  "format": "liverecorder.rooms",
+  "version": 1,
+  "rooms": [
+    {
+      "platform": "bilibili",
+      "identity": "123456",
+      "name": "哔哩哔哩示例主播"
+    },
+    {
+      "platform": "douyu",
+      "identity": "https://www.douyu.com/123456",
+      "name": "斗鱼示例主播"
+    },
+    {
+      "platform": "huya",
+      "identity": "123456",
+      "name": "虎牙示例主播"
+    },
+    {
+      "platform": "douyin",
+      "identity": "https://live.douyin.com/?live_web_rid=338036396491",
+      "name": ""
+    },
+    {
+      "platform": "youtube",
+      "identity": "UC0123456789012345678901",
+      "name": "YouTube 示例频道"
+    },
+    {
+      "platform": "twitch",
+      "identity": "https://www.twitch.tv/example_streamer",
+      "name": "Twitch 示例主播"
+    }
+  ]
+}

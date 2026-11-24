@@ -10,6 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
 
+from ..catalog import directory_identity
 from ..paths import checked_path, require_recording_handle, require_recording_volume, safe_component, safe_join
 from .media import finalize
 
@@ -19,23 +20,38 @@ class OutputSpaceError(RuntimeError):
 
 
 def output_directory(root: Path, name: str, platform: str, room_id: int, *, min_free_bytes: int,
-                     on_create=None, namespace="") -> Path:
+                     on_create=None, namespace="", preferred=None, require_owned=False) -> Path:
     root = checked_path(root)
     root.mkdir(parents=True, exist_ok=True)
     if shutil.disk_usage(root).free < min_free_bytes:
         raise OutputSpaceError("录制盘可用空间不足")
+    if preferred is not None:
+        directory, identity = preferred
+        if directory.parent == root:
+            try:
+                if directory_identity(require_recording_volume(directory)) == identity:
+                    return directory
+            except (OSError, ValueError):
+                pass
     suffix = f"-{namespace}" if namespace else ""
     component = safe_component(f"{safe_component(name)[:35]} [{platform}-{room_id}{suffix}]")
-    directory = safe_join(root, component)
-    try:
-        directory.mkdir()
-    except FileExistsError:
-        if not checked_path(directory).is_dir():
-            raise
-    else:
-        if on_create is not None:
-            on_create(checked_path(directory))
-    return checked_path(directory)
+    for extra in ("", *(f"-{uuid4().hex[:8]}" for _ in range(3))):
+        try:
+            directory = safe_join(root, component + extra)
+            directory.mkdir()
+        except FileExistsError:
+            if not require_owned:
+                if checked_path(directory).is_dir():
+                    return directory
+                raise
+        except ValueError:
+            if not require_owned:
+                raise
+        else:
+            if on_create is not None:
+                on_create(checked_path(directory))
+            return checked_path(directory)
+    raise FileExistsError("无法创建独立且安全的主播录像目录")
 
 
 def serve(room_id: int, capture) -> None:
@@ -57,7 +73,7 @@ def serve(room_id: int, capture) -> None:
 
 def record_loop(stop, emit, open_stream, root, name, platform, room_id, ffmpeg, ffprobe,
                 *, interval=15, min_free_bytes=512 * 1024**2, container=".mkv", on_directory_created=None,
-                on_published=None, namespace="", journal=None):
+                on_published=None, namespace="", journal=None, resolve_output=None):
     delay = interval
     while not stop.is_set():
         partial = None
@@ -77,15 +93,28 @@ def record_loop(stop, emit, open_stream, root, name, platform, room_id, ffmpeg, 
                 if stop.is_set():
                     break
                 require_recording_volume(root)
-                directory = output_directory(root, name, platform, room_id, min_free_bytes=min_free_bytes,
-                                             on_create=on_directory_created, namespace=namespace)
+                display_name, preferred = resolve_output() if resolve_output else (name, None)
+                directory = output_directory(root, display_name, platform, room_id, min_free_bytes=min_free_bytes,
+                                             on_create=on_directory_created, namespace=namespace, preferred=preferred,
+                                             require_owned=resolve_output is not None)
+                archive_stamp = preferred[1] if preferred is not None and preferred[0] == directory else directory_identity(directory)
+                if archive_stamp is None:
+                    raise ValueError("无法确认主播录像目录身份")
+
+                def verify_archive(path):
+                    path = require_recording_volume(path)
+                    if directory_identity(directory) != archive_stamp:
+                        raise ValueError("主播录像目录身份已变化")
+                    return path
+
                 timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
                 stem = f"{timestamp}_{uuid4().hex[:10]}_{safe_component(title)[:40]}"
                 partial = safe_join(directory, stem + ".partial" + extension)
                 target = safe_join(directory, stem + container)
-                require_recording_volume(partial)
+                verify_archive(partial)
                 with partial.open("xb") as output:
                     require_recording_handle(output, partial)
+                    verify_archive(partial)
                     session = None
                     if journal:
                         with journal() as log:
@@ -102,7 +131,7 @@ def record_loop(stop, emit, open_stream, root, name, platform, room_id, ffmpeg, 
                             break
                         now = monotonic()
                         if now >= next_check:
-                            require_recording_volume(directory)
+                            verify_archive(directory)
                             if shutil.disk_usage(directory).free < min_free_bytes + output.tell() + len(block):
                                 emit("disk_low", "录像盘余量不足，停止写入并尝试封装本段", partial)
                                 disk_limited = True
@@ -116,12 +145,12 @@ def record_loop(stop, emit, open_stream, root, name, platform, room_id, ffmpeg, 
                     original = os.fstat(output.fileno())
             if original.st_size:
                 emit("finalizing", "正在无损封装", partial)
-                require_recording_volume(target)
+                verify_archive(target)
                 if shutil.disk_usage(directory).free < original.st_size + min_free_bytes:
                     raise OutputSpaceError("录像盘空间不足，已保留未封装片段")
 
                 def prepare(stamp):
-                    require_recording_volume(target)
+                    verify_archive(target)
                     if journal:
                         with journal() as log:
                             log.prepare(session, stamp)
@@ -134,7 +163,7 @@ def record_loop(stop, emit, open_stream, root, name, platform, room_id, ffmpeg, 
                         on_published(path, stamp)
 
                 published = finalize(partial, target, ffmpeg, ffprobe, on_published=commit, before_publish=prepare,
-                                     guard=require_recording_volume)
+                                     guard=verify_archive)
                 # Only remove the private staging file created by this recording.
                 try:
                     current = checked_path(partial).stat()

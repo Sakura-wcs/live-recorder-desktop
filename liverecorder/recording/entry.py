@@ -29,7 +29,9 @@ def main():
     configure_hidden_ffmpeg()
     paths = AppPaths.from_root(args.data)
     with Catalog(paths.catalog) as catalog:
-        room = next(item for item in catalog.rooms() if item.id == args.room_id)
+        room = catalog.visible_room(args.room_id)
+    if room is None:
+        return
     adapter = adapter_for(room.platform)
     root = require_recording_volume(paths.recording_root(args.recordings))
     namespace = sha256(normcase(str(paths.catalog.resolve())).encode("utf-8")).hexdigest()[:16]
@@ -39,12 +41,38 @@ def main():
         root.mkdir(parents=True, exist_ok=True)
         require_recording_volume(root)
         os.environ["TEMP"] = os.environ["TMP"] = str(root)
+        current_name = room.name
+
+        def fill_name(author):
+            nonlocal current_name
+            if stop.is_set():
+                return
+            try:
+                with Catalog(paths.catalog) as catalog:
+                    updated = catalog.fill_pending_name(room, author)
+                    current = catalog.visible_room(room.id)
+                    if current is not None:
+                        current_name = current.name
+                if updated:
+                    emit("name_filled", "主播名称已自动补齐")
+            except (sqlite3.Error, OSError, ValueError):
+                emit("notice", "暂时无法保存主播名称，将在下次检测时重试。")
+
         def open_stream():
             with Catalog(paths.catalog) as catalog:
                 wait = catalog.reserve_probe(room.platform)
             if stop.wait(wait):
                 return None
-            return adapter.detect(room.identity, platform_settings.load(room.platform), args.ffmpeg)
+            return adapter.detect(room.identity, platform_settings.load(room.platform), args.ffmpeg,
+                                  on_author=None if current_name else fill_name)
+
+        def resolve_output():
+            try:
+                with Catalog(paths.catalog) as catalog:
+                    directory = catalog.recording_directory(room.id, root)
+            except (sqlite3.Error, OSError, ValueError):
+                directory = None
+            return current_name or room.identity, directory
 
         def register(directory):
             try:
@@ -58,9 +86,9 @@ def main():
             with Catalog(paths.catalog) as catalog:
                 yield RecordingJournal(catalog)
 
-        record_loop(stop, emit, open_stream, root, room.name, room.platform, room.id,
+        record_loop(stop, emit, open_stream, root, room.display_name, room.platform, room.id,
                     args.ffmpeg, args.ffprobe, container="." + args.container, on_directory_created=register,
-                    journal=journal, namespace=namespace)
+                    journal=journal, namespace=namespace, resolve_output=resolve_output)
 
     serve(room.id, capture)
 

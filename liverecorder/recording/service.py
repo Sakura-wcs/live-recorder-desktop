@@ -9,18 +9,22 @@ class RecordingService:
         self.supervisor = Supervisor(command, limit=limit)
 
     def start(self, room):
-        started = self.supervisor.start(room.id)
-        if started:
-            try:
-                self.catalog.save_room(room.platform, room.identity, room.name, monitored=True)
-            except Exception:
-                self.supervisor.stop(room.id)
-                raise
-        return started
+        current = self.catalog.visible_room(room.id)
+        if current is None or self.supervisor.pending(room.id):
+            return False
+        if not current.monitored:
+            self.catalog.set_monitored(room.id, True)
+        started = False
+        try:
+            started = self.supervisor.start(room.id)
+            return started
+        finally:
+            if not started and not current.monitored:
+                self.catalog.set_monitored(room.id, False)
 
     def stop(self, room):
         self.supervisor.stop(room.id)
-        self.catalog.save_room(room.platform, room.identity, room.name, monitored=False)
+        self.catalog.set_monitored(room.id, False)
 
     def resume(self):
         for room in self.catalog.rooms():

@@ -136,6 +136,9 @@ class Supervisor:
                     event = self._events.get_nowait()
                 except Empty:
                     return
+                if event.state == "name_filled":
+                    events.append(event)
+                    continue
                 past = self._phases.get(event.room_id)
                 if event.room_id in self._active:
                     self._phases[event.room_id] = event.state

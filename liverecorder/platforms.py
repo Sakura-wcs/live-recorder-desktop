@@ -1,3 +1,4 @@
+import json
 import logging
 import re
 from contextlib import suppress
@@ -5,6 +6,7 @@ from dataclasses import dataclass
 from http.cookies import SimpleCookie
 from importlib import import_module
 from pathlib import Path
+from unicodedata import category
 from urllib.parse import parse_qs, urlsplit
 
 from .settings import PLATFORMS
@@ -22,6 +24,85 @@ class PlatformFailure(RuntimeError):
     def __init__(self, code: str, message: str):
         super().__init__(message)
         self.code = code
+
+
+_NAME_NOTICES = {
+    "missing": "平台未返回主播名称，可留空保存，监控时自动补齐。",
+    "offline": "当前未开播，未获取到主播名称；可留空保存。",
+    "timeout": "获取主播名称超时，可留空保存。",
+    "network": "网络连接失败，可留空保存。",
+    "rate_limit": "平台查询频率受限，可留空保存。",
+    "access": "平台拒绝访问，请检查平台配置或网络；也可留空保存。",
+    "identity": "平台返回的房间与输入不一致，可留空保存。",
+    "platform": "暂时无法读取平台房间信息，可留空保存。",
+}
+
+
+@dataclass(frozen=True)
+class NameLookup:
+    name: str | None = None
+    reason: str = "missing"
+
+    @property
+    def notice(self) -> str:
+        return _NAME_NOTICES.get(self.reason, "")
+
+
+def clean_author(value):
+    if isinstance(value, str):
+        value = value.strip()
+        if value and not any(category(char) in {"Cc", "Cs"} for char in value):
+            return value[:128].rstrip()
+    return None
+
+
+_DOUYIN_FRAME = re.compile(r'self\.__pace_f\.push\(\[\d+,("\w+:.+?")\]\)</script>')
+
+
+def _douyin_name(response, url):
+    if response.status_code != 200:
+        return None
+    requested, returned = urlsplit(url), urlsplit(response.url)
+    if (returned.netloc, returned.path.rstrip("/")) != (requested.netloc, requested.path.rstrip("/")):
+        return NameLookup(reason="identity")
+    # The public room page can contain room state even when it has no streams.
+    frames = [item for item in _DOUYIN_FRAME.findall(response.text) if "state" in item and "streamStore" in item]
+    if not frames:
+        return None
+    try:
+        states = json.loads(json.loads(frames[-1]).partition(":")[2])
+        [state] = [item["state"] for item in states if isinstance(item, dict) and "state" in item]
+        room = state["roomStore"]["roomInfo"]["room"]
+        web_rid = room.get("web_rid")
+        # `id_str` is an internal stream ID and need not match the public room URL.
+        if web_rid not in (None, "") and str(web_rid) != requested.path.strip("/"):
+            return NameLookup(reason="identity")
+        owner = room.get("owner")
+        name = clean_author(owner.get("nickname")) if isinstance(owner, dict) else None
+        if name:
+            return NameLookup(name, "found")
+        return NameLookup(reason="offline" if room.get("status") == 4 else "missing")
+    except (AttributeError, KeyError, TypeError, ValueError, RecursionError):
+        return None
+
+
+def _name_observer(session, url, platform):
+    metadata = None
+
+    def inspect(response, **_kwargs):
+        nonlocal metadata
+        metadata = _douyin_name(response, url) or metadata
+
+    if platform == "douyin":
+        session.http.hooks["response"].append(inspect)
+
+    def result(plugin):
+        if metadata is not None and (metadata.name or metadata.reason == "identity"):
+            return metadata
+        author = clean_author(plugin.get_author())
+        return NameLookup(author, "found") if author else metadata or NameLookup()
+
+    return result
 
 
 class _SessionStream:
@@ -51,7 +132,7 @@ class _SessionStream:
             self.http.close()
 
 
-def _platform_failure(error):
+def _platform_failure(error, *, for_name=False):
     from requests.exceptions import RequestException, Timeout, ConnectionError
     from streamlink.exceptions import FatalPluginError, StreamError
 
@@ -69,6 +150,8 @@ def _platform_failure(error):
                 return PlatformFailure("access", "平台拒绝访问，请检查授权、平台配置或网络地区。")
             if status == 429:
                 return PlatformFailure("rate_limit", "平台请求过于频繁，已暂停后重试。")
+        if for_name and isinstance(current, Timeout):
+            return PlatformFailure("timeout", "平台请求超时")
         if isinstance(current, (Timeout, ConnectionError)):
             return PlatformFailure("network", "平台连接失败或超时，请检查网络或代理。")
         if isinstance(current, FatalPluginError):
@@ -163,18 +246,31 @@ class Adapter:
                 session.http.cookies.set(key, morsel.value, domain=COOKIES[self.platform], path="/", secure=True)
         return session
 
-    def lookup_name(self, identity: str, settings: dict) -> str | None:
+    def lookup_name(self, identity: str, settings: dict) -> NameLookup:
+        from requests.exceptions import RequestException
+        from streamlink.exceptions import NoStreamsError, StreamlinkError
+
+        url = self.url(identity)
         session = self._session(settings, {"http-timeout": 5})
         with session.http:
-            # Use the same plugin and platform credentials, but never open a media stream.
-            plugin = self.plugin_class()(session, self.url(identity))
-            author = plugin.get_author()
-            if not author:
+            result = _name_observer(session, url, self.platform)
+            plugin = self.plugin_class()(session, url)
+            try:
+                initial = result(plugin)
+                if initial.name:
+                    return initial
                 plugin.streams()
-                author = plugin.get_author()
-            return author or None
+                return result(plugin)
+            except NoStreamsError:
+                return result(plugin)
+            except (StreamlinkError, RequestException) as error:
+                observed = result(plugin)
+                return observed if observed.reason != "missing" else NameLookup(reason=_platform_failure(error, for_name=True).code)
+            except (ValueError, TypeError, KeyError, AttributeError):
+                observed = result(plugin)
+                return observed if observed.reason != "missing" else NameLookup(reason="platform")
 
-    def detect(self, identity: str, settings: dict, ffmpeg: Path):
+    def detect(self, identity: str, settings: dict, ffmpeg: Path, *, on_author=None):
         from requests.exceptions import RequestException
         from streamlink.exceptions import NoStreamsError, StreamlinkError
         from streamlink.stream.ffmpegmux import MuxedStream
@@ -186,8 +282,16 @@ class Adapter:
                                           "ffmpeg-fout": "matroska"})
         keep_session = False
         try:
-            plugin = self.plugin_class()(session, self.url(identity))
-            streams = plugin.streams()
+            url = self.url(identity)
+            result = _name_observer(session, url, self.platform) if on_author is not None else None
+            plugin = self.plugin_class()(session, url)
+            try:
+                streams = plugin.streams()
+            except NoStreamsError:
+                streams = None
+            finally:
+                if result is not None and (author := result(plugin).name):
+                    on_author(author)
             if not streams:
                 return None
             stream = streams.get("best")

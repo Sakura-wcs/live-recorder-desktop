@@ -28,7 +28,7 @@ def _text(value, maximum):
 
 def _room(platform, identity, name):
     platform = _text(platform, 16)
-    return platform, normalize_room(platform, _text(identity, 2048)), _text(name, 128)
+    return platform, normalize_room(platform, _text(identity, 2048)), "" if name == "" else _text(name, 128)
 
 
 def _shareable_name(name, identity):
